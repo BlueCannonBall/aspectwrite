@@ -851,6 +851,46 @@ mod tests {
     }
 
     #[test]
+    fn neighboring_square_brackets_have_visible_ink_gap() {
+        let hand = fixture();
+        let mut layout = Layout {
+            hand: &hand,
+            seed: 0,
+            occurrences: HashMap::new(),
+        };
+        for expression in [r"\left[x\right]\left[x\right]", "]["] {
+            let result = layout.layout(&parse(expression).unwrap()).unwrap();
+            let brackets: Vec<_> = result
+                .marks
+                .iter()
+                .filter(|mark| mark.points.len() == 4)
+                .collect();
+            let (right, left) = if expression.starts_with(r"\left") {
+                assert_eq!(brackets.len(), 4, "{expression}");
+                (brackets[1], brackets[2])
+            } else {
+                assert_eq!(brackets.len(), 2, "{expression}");
+                (brackets[0], brackets[1])
+            };
+            let max_right = right
+                .points
+                .iter()
+                .map(|point| point.0)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let min_left = left
+                .points
+                .iter()
+                .map(|point| point.0)
+                .fold(f32::INFINITY, f32::min);
+            assert!(
+                min_left - max_right >= 18.0,
+                "{expression}: gap = {}",
+                min_left - max_right
+            );
+        }
+    }
+
+    #[test]
     fn parenthesis_variation_is_subtle_distinct_and_repeatable() {
         let hand = fixture();
         let result = Layout {
