@@ -1,0 +1,7 @@
+/target
+/.local/
+/examples/rendered/
+.pi/extensions/node_modules/
+*.png
+*strokes*.json
+!package-lock.json

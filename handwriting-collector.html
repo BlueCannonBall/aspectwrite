@@ -1,0 +1,1049 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Aspectwrite handwriting collector</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #182230;
+      --muted: #5d6b7b;
+      --line: #d6dee8;
+      --panel: #ffffff;
+      --page: #f3f6fa;
+      --accent: #2563eb;
+      --accent-dark: #1d4ed8;
+      --baseline: #dc2626;
+      --success: #047857;
+      --warning: #b45309;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--page);
+      color: var(--ink);
+      font: 16px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      width: min(100% - 2rem, 980px);
+      margin: 0 auto;
+      padding: 2rem 0 3rem;
+    }
+
+    h1, h2, p { margin-top: 0; }
+    h1 { margin-bottom: .35rem; font-size: clamp(1.65rem, 4vw, 2.35rem); }
+    h2 { margin-bottom: .4rem; font-size: 1.1rem; }
+
+    .intro { color: var(--muted); max-width: 72ch; }
+
+    .panel {
+      margin-top: 1rem;
+      padding: 1.15rem;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      box-shadow: 0 5px 18px rgb(30 55 90 / 5%);
+    }
+
+    .progress-line,
+    .prompt-line,
+    .toolbar,
+    .file-toolbar,
+    .footer-line {
+      display: flex;
+      align-items: center;
+      gap: .75rem;
+      flex-wrap: wrap;
+    }
+
+    .progress-line { justify-content: space-between; margin-bottom: .5rem; }
+    progress { width: 100%; height: .7rem; accent-color: var(--accent); }
+    .progress-label { color: var(--muted); font-variant-numeric: tabular-nums; }
+
+    .prompt-line { align-items: flex-start; justify-content: space-between; }
+    .prompt-copy { flex: 1 1 18rem; }
+    .category { color: var(--accent-dark); font-size: .9rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; }
+    .notation { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .description { margin-top: .35rem; color: var(--muted); }
+    .symbol-preview {
+      display: grid;
+      place-items: center;
+      min-width: 5.4rem;
+      min-height: 5.4rem;
+      padding: .5rem 1rem;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #f8fafc;
+      font: 3rem/1 Georgia, "Times New Roman", serif;
+    }
+
+    .status { color: var(--muted); }
+    .status.complete { color: var(--success); font-weight: 650; }
+    .status.skipped { color: var(--warning); font-weight: 650; }
+
+    .canvas-wrap {
+      position: relative;
+      margin-top: 1rem;
+      overflow: hidden;
+      border: 1px solid #b9c7d8;
+      border-radius: 10px;
+      background: white;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: auto;
+      aspect-ratio: 800 / 320;
+      touch-action: none;
+      cursor: crosshair;
+    }
+
+    .canvas-help { margin: .55rem 0 0; color: var(--muted); font-size: .9rem; }
+
+    button,
+    .file-button {
+      min-height: 2.45rem;
+      padding: .5rem .85rem;
+      border: 1px solid #b7c4d4;
+      border-radius: 8px;
+      background: white;
+      color: var(--ink);
+      font: inherit;
+      cursor: pointer;
+    }
+
+    button:hover,
+    .file-button:hover { border-color: var(--accent); background: #f8fbff; }
+    button:focus-visible,
+    .file-button:focus-visible { outline: 3px solid rgb(37 99 235 / 28%); outline-offset: 2px; }
+    button:disabled { cursor: not-allowed; opacity: .45; }
+    .primary { border-color: var(--accent); background: var(--accent); color: white; }
+    .primary:hover { border-color: var(--accent-dark); background: var(--accent-dark); }
+    .danger { color: #b91c1c; }
+
+    .toolbar { margin-top: 1rem; }
+    .toolbar .spacer { flex: 1 1 auto; }
+    .notice { min-height: 1.5rem; margin: .7rem 0 0; color: var(--muted); }
+    .notice.error { color: #b91c1c; }
+    .notice.success { color: var(--success); }
+
+    .file-toolbar { margin-top: .5rem; }
+    .storage-status { margin: .65rem 0 0; color: var(--muted); font-size: .9rem; }
+    .storage-status.warning { color: var(--warning); }
+    input[type="file"] { display: none; }
+    .export-text {
+      display: none;
+      width: 100%;
+      min-height: 12rem;
+      margin-top: .75rem;
+      padding: .75rem;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #f8fafc;
+      color: var(--ink);
+      font: .8rem/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      resize: vertical;
+    }
+    .export-text.visible { display: block; }
+    details { color: var(--muted); }
+    summary { color: var(--ink); cursor: pointer; font-weight: 650; }
+    pre {
+      max-width: 100%;
+      overflow: auto;
+      padding: .75rem;
+      border-radius: 8px;
+      background: #172033;
+      color: #e5edf7;
+      font-size: .82rem;
+    }
+
+    .footer-line { justify-content: space-between; margin-top: 1.5rem; color: var(--muted); font-size: .9rem; }
+    .footer-line a { color: var(--accent-dark); }
+
+    @media (max-width: 560px) {
+      main { width: min(100% - 1rem, 980px); padding-top: 1rem; }
+      .panel { padding: .85rem; }
+      .symbol-preview { min-width: 4.5rem; min-height: 4.5rem; font-size: 2.5rem; }
+      .toolbar button { flex: 1 1 auto; }
+      .toolbar .spacer { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Aspectwrite handwriting collector</h1>
+      <p class="intro">
+        Draw one glyph at a time on the canvas. The red line is the baseline:
+        letters normally sit on it, while ascenders go above and descenders go
+        below. The page autosaves when the browser permits it; export is the
+        durable source of truth.
+      </p>
+    </header>
+
+    <section class="panel" aria-labelledby="progress-heading">
+      <div class="progress-line">
+        <strong id="progress-heading">Collection progress</strong>
+        <span id="progressLabel" class="progress-label"></span>
+      </div>
+      <progress id="progressBar" value="0" max="1" aria-label="Collection progress"></progress>
+    </section>
+
+    <section class="panel" aria-labelledby="prompt-heading">
+      <div class="prompt-line">
+        <div class="prompt-copy">
+          <div id="category" class="category"></div>
+          <h2 id="prompt-heading">Draw this glyph</h2>
+          <div id="notation" class="notation"></div>
+          <div id="description" class="description"></div>
+          <p id="sampleStatus" class="status">Not started</p>
+        </div>
+        <div id="symbolPreview" class="symbol-preview" aria-label="Glyph preview"></div>
+      </div>
+
+      <div class="canvas-wrap">
+        <canvas id="drawingCanvas" width="800" height="320" aria-label="Drawing canvas"></canvas>
+      </div>
+      <p class="canvas-help">Use a mouse, pen, or finger. Draw only the requested glyph; the guide lines are not exported.</p>
+
+      <div class="toolbar">
+        <button id="previousButton" type="button">Previous</button>
+        <button id="variantPrevious" type="button">Previous variant</button>
+        <button id="variantNext" type="button">Next variant</button>
+        <button id="variantAdd" type="button">Add variant</button>
+        <button id="undoButton" type="button">Undo stroke</button>
+        <button id="clearButton" type="button">Clear sample</button>
+        <button id="skipButton" type="button">Skip</button>
+        <span class="spacer"></span>
+        <button id="nextButton" class="primary" type="button">Save sample &amp; next</button>
+      </div>
+      <p id="notice" class="notice" role="status" aria-live="polite"></p>
+    </section>
+
+    <section class="panel" aria-labelledby="file-heading">
+      <h2 id="file-heading">Stroke file</h2>
+      <p>
+        Export creates a v2 JSON file with one entry for every requested glyph. Letters and digits may have up to three samples; use Add variant after drawing the first. Import v1 files without recollection; keep your original export as a backup.
+        Coordinates are normalized so the baseline is <code>y = 0</code> and
+        positive y points upward. Each entry contains its stroke list and ink
+        bounding box. Skipped or empty entries are included and marked missing,
+        so an incomplete file is detectable later.
+      </p>
+      <div class="file-toolbar">
+        <button id="exportButton" class="primary" type="button">Export JSON</button>
+        <button id="copyButton" type="button">Copy JSON</button>
+        <button id="importButton" type="button">Import JSON</button>
+        <button id="resetButton" class="danger" type="button">Reset all samples</button>
+        <input id="importFile" type="file" accept="application/json,.json">
+      </div>
+      <p id="storageStatus" class="storage-status" role="status" aria-live="polite"></p>
+      <textarea id="exportText" class="export-text" readonly aria-label="Exported stroke JSON"></textarea>
+      <details>
+        <summary>What is not collected?</summary>
+        <p>
+          Braces, parentheses, brackets, bars, and angle delimiters are omitted
+          because they need to scale around fractions and roots. Fraction bars,
+          radical bars, accent strokes, and other layout primitives are also not
+          separate prompts. Named operators such as sin and lim are composed
+          from the collected Latin letters. Equivalent LaTeX command aliases
+          share one visual sample; the exported entry records those aliases.
+        </p>
+      </details>
+      <details>
+        <summary>Export shape</summary>
+        <pre id="formatPreview"></pre>
+      </details>
+    </section>
+
+    <div class="footer-line">
+      <span>Phase two · self-contained, offline collector</span>
+      <a href="docs/latex-subset.md">LaTeX subset specification</a>
+    </div>
+  </main>
+
+  <script>
+    "use strict";
+
+    // The command prefix is constructed rather than written into JavaScript
+    // string literals so command names cannot be changed by JS escape rules.
+    const COMMAND_PREFIX = String.fromCharCode(92);
+    const LOGICAL_WIDTH = 800;
+    const LOGICAL_HEIGHT = 320;
+    const BASELINE_Y = 220;
+    const STORAGE_KEY = "aspectwrite.handwriting-session.v1";
+
+    function makeItem(key, display, category, kind, notation, aliases = [], description = "") {
+      return {
+        key,
+        display,
+        category,
+        kind,
+        notation: notation === undefined ? key : notation,
+        aliases,
+        description
+      };
+    }
+
+    function letters(category, value) {
+      return Array.from(value, ch => makeItem(ch, ch, category, "literal", ch));
+    }
+
+    function commands(category, entries) {
+      return entries.map(([name, display, aliasNames = [], description = ""]) => {
+        const key = COMMAND_PREFIX + name;
+        const aliases = aliasNames.map(alias => COMMAND_PREFIX + alias);
+        return makeItem(key, display, category, "command", key, aliases, description);
+      });
+    }
+
+    const punctuation = [
+      ["+", "+", [], "Addition or positive sign"],
+      ["-", "−", [], "Subtraction or negative sign"],
+      ["=", "=", [], "Equality"],
+      ["<", "<", [], "Less-than relation"],
+      [">", ">", [], "Greater-than relation"],
+      ["/", "/", [], "Slash"],
+      ["*", "∗", [COMMAND_PREFIX + "ast"], "Multiplication star"],
+      [".", ".", [], "Period or decimal point"],
+      [",", ",", [], "Comma"],
+      [":", ":", [], "Colon"],
+      [";", ";", [], "Semicolon"],
+      ["!", "!", [], "Exclamation mark or factorial"],
+      ["?", "?", [], "Question mark"],
+      ["'", "′", [COMMAND_PREFIX + "prime"], "Prime mark or derivative mark"],
+      ["\"", "\"", [], "Quotation mark"]
+    ].map(([key, display, aliases, description]) => makeItem(key, display, "Punctuation", "literal", key, aliases, description));
+
+    const items = [
+      ...letters("Uppercase letters", "ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+      ...letters("Lowercase letters", "abcdefghijklmnopqrstuvwxyz"),
+      ...letters("Digits", "0123456789"),
+      ...punctuation,
+      ...commands("Punctuation", [["%", "%", [], "Percent sign"]]),
+      ...commands("Greek letters", [
+        ["alpha", "α"], ["beta", "β"], ["gamma", "γ"], ["delta", "δ"],
+        ["epsilon", "ϵ"], ["zeta", "ζ"], ["eta", "η"], ["theta", "θ"],
+        ["iota", "ι"], ["kappa", "κ"], ["lambda", "λ"], ["mu", "μ"],
+        ["nu", "ν"], ["xi", "ξ"], ["pi", "π"], ["rho", "ρ"],
+        ["sigma", "σ"], ["tau", "τ"], ["upsilon", "υ"], ["phi", "ϕ"],
+        ["chi", "χ"], ["psi", "ψ"], ["omega", "ω"],
+        ["Gamma", "Γ"], ["Delta", "Δ"], ["Theta", "Θ"], ["Lambda", "Λ"],
+        ["Xi", "Ξ"], ["Pi", "Π"], ["Sigma", "Σ"], ["Upsilon", "Υ"],
+        ["Phi", "Φ"], ["Psi", "Ψ"], ["Omega", "Ω"]
+      ]),
+      ...commands("Calculus and physics symbols", [
+        ["partial", "∂", [], "Partial derivative"],
+        ["nabla", "∇", [], "Gradient, divergence, or curl"],
+        ["infty", "∞", [], "Infinity"],
+        ["ell", "ℓ", [], "Script ell, often used for length"],
+        ["hbar", "ℏ", [], "Reduced Planck constant"],
+        ["Re", "ℜ", [], "Real part of a complex quantity"],
+        ["Im", "ℑ", [], "Imaginary part of a complex quantity"],
+        ["degree", "°", [], "Degree marker"],
+        ["circ", "∘", [], "Circle or composition operator"],
+        ["star", "★", [], "Star operator"]
+      ]),
+      ...commands("Number sets", [
+        ["mathbb{R}", "ℝ", [], "The set of real numbers"]
+      ]),
+      ...commands("Large operators", [
+        ["int", "∫", ["iint", "iiint"], "Integral; repeated-integral commands reuse this sample"],
+        ["oint", "∮", [], "Closed-line integral"],
+        ["sum", "∑", [], "Summation"],
+        ["prod", "∏", [], "Product" ]
+      ]),
+      ...commands("Binary operators", [
+        ["pm", "±", [], "Plus or minus"], ["mp", "∓", [], "Minus or plus"],
+        ["times", "×", [], "Multiplication"], ["cdot", "·", [], "Centered multiplication dot"],
+        ["div", "÷", [], "Division"], ["oplus", "⊕", [], "Direct sum or XOR-like operation"],
+        ["otimes", "⊗", [], "Tensor product"]
+      ]),
+      ...commands("Relations", [
+        ["ne", "≠", [], "Not equal"], ["equiv", "≡", [], "Equivalent or identical"],
+        ["approx", "≈", [], "Approximately equal"], ["simeq", "≃", [], "Similar or asymptotically equal"],
+        ["sim", "∼", [], "Similar to"], ["propto", "∝", [], "Proportional to"],
+        ["le", "≤", [], "Less than or equal"], ["ge", "≥", [], "Greater than or equal"],
+        ["ll", "≪", [], "Much less than"], ["gg", "≫", [], "Much greater than"],
+        ["in", "∈", [], "Element of a set"], ["notin", "∉", [], "Not an element of a set"],
+        ["mid", "∣", [], "Divides or conditional bar"], ["parallel", "∥", [], "Parallel"]
+      ]),
+      ...commands("Arrows", [
+        ["rightarrow", "→", ["to", "longrightarrow", "xrightarrow"], "Right-pointing arrow; labeled and long forms reuse it"],
+        ["leftarrow", "←", ["longleftarrow", "xleftarrow"], "Left-pointing arrow"],
+        ["leftrightarrow", "↔", ["xleftrightarrow"], "Two-way arrow"],
+        ["Rightarrow", "⇒", ["Longrightarrow"], "Right implication"],
+        ["Leftarrow", "⇐", [], "Left implication"],
+        ["Leftrightarrow", "⇔", [], "Logical equivalence"],
+        ["mapsto", "↦", [], "Maps to"],
+        ["uparrow", "↑", [], "Up arrow"],
+        ["downarrow", "↓", [], "Down arrow"],
+        ["rightleftharpoons", "⇌", [], "Reversible chemical reaction"]
+      ])
+    ];
+
+    const itemByKey = new Map(items.map(item => [item.key, item]));
+    const keyToItem = new Map(itemByKey);
+    for (const item of items) {
+      for (const alias of item.aliases) {
+        if (keyToItem.has(alias) && keyToItem.get(alias) !== item) {
+          throw new Error(`The handwriting inventory aliases two glyphs to ${alias}.`);
+        }
+        keyToItem.set(alias, item);
+      }
+    }
+    if (itemByKey.size !== items.length) {
+      throw new Error("The handwriting glyph inventory contains duplicate keys.");
+    }
+
+    const canvas = document.getElementById("drawingCanvas");
+    const context = canvas.getContext("2d");
+    const categoryElement = document.getElementById("category");
+    const previewElement = document.getElementById("symbolPreview");
+    const notationElement = document.getElementById("notation");
+    const descriptionElement = document.getElementById("description");
+    const statusElement = document.getElementById("sampleStatus");
+    const progressBar = document.getElementById("progressBar");
+    const progressLabel = document.getElementById("progressLabel");
+    const noticeElement = document.getElementById("notice");
+    const previousButton = document.getElementById("previousButton");
+    const undoButton = document.getElementById("undoButton");
+    const clearButton = document.getElementById("clearButton");
+    const skipButton = document.getElementById("skipButton");
+    const nextButton = document.getElementById("nextButton");
+    const exportButton = document.getElementById("exportButton");
+    const copyButton = document.getElementById("copyButton");
+    const importButton = document.getElementById("importButton");
+    const storageStatusElement = document.getElementById("storageStatus");
+    const exportText = document.getElementById("exportText");
+    const importFile = document.getElementById("importFile");
+    const resetButton = document.getElementById("resetButton");
+    const formatPreview = document.getElementById("formatPreview");
+
+    // Internal points use canvas coordinates: origin at the upper-left and y
+    // increasing downwards. Exported points use baseline coordinates instead.
+    let currentIndex = 0;
+    let currentStrokes = [];
+    let activeStroke = null;
+    let strokeStartTime = 0;
+    let storageAvailable = false;
+    const samples = new Map();
+    let variantIndex = 0;
+    const variantPrevious = document.getElementById("variantPrevious");
+    const variantNext = document.getElementById("variantNext");
+    const variantAdd = document.getElementById("variantAdd");
+    const maxVariants = item => /^[A-Za-z0-9]$/.test(item.key) ? 3 : 1;
+
+    function initializeStorage() {
+      try {
+        const probeKey = `${STORAGE_KEY}.probe`;
+        window.localStorage.setItem(probeKey, "ok");
+        window.localStorage.removeItem(probeKey);
+        storageAvailable = true;
+        storageStatusElement.textContent = "Session autosave is enabled for this browser.";
+        storageStatusElement.className = "storage-status";
+      } catch (error) {
+        storageAvailable = false;
+        storageStatusElement.textContent = "Browser session storage is unavailable. Samples remain in this tab; export JSON before closing it.";
+        storageStatusElement.className = "storage-status warning";
+      }
+    }
+
+    function round(value, digits = 3) {
+      const scale = 10 ** digits;
+      return Math.round(value * scale) / scale;
+    }
+
+    function finite(value, fallback = 0) {
+      return Number.isFinite(value) ? value : fallback;
+    }
+
+    function hasInk(strokes) {
+      return strokes.some(stroke => stroke.length > 0);
+    }
+
+    function pointCount(strokes) {
+      return strokes.reduce((total, stroke) => total + stroke.length, 0);
+    }
+
+    function normalizedStrokes(rawStrokes) {
+      return rawStrokes
+        .filter(stroke => stroke.length > 0)
+        .map(stroke => stroke.map(point => ({
+          x: round(finite(point.x)),
+          y: round(BASELINE_Y - finite(point.y)),
+          t: round(finite(point.t)),
+          p: round(Math.min(1, Math.max(0, finite(point.p, .5))), 3)
+        })));
+    }
+
+    function rawStrokes(normalized) {
+      if (!Array.isArray(normalized)) return [];
+      return normalized
+        .filter(stroke => Array.isArray(stroke) && stroke.length > 0)
+        .map(stroke => stroke.map(point => ({
+          x: finite(point.x),
+          y: BASELINE_Y - finite(point.y),
+          t: finite(point.t),
+          p: Math.min(1, Math.max(0, finite(point.p, .5)))
+        })));
+    }
+
+    function boundingBox(strokes) {
+      const points = strokes.flat();
+      if (points.length === 0) return null;
+      const xs = points.map(point => point.x);
+      const ys = points.map(point => point.y);
+      const minX = Math.min(...xs);
+      const maxX = Math.max(...xs);
+      const minY = Math.min(...ys);
+      const maxY = Math.max(...ys);
+      return {
+        minX: round(minX),
+        minY: round(minY),
+        maxX: round(maxX),
+        maxY: round(maxY),
+        width: round(maxX - minX),
+        height: round(maxY - minY)
+      };
+    }
+
+    function currentItem() {
+      return items[currentIndex];
+    }
+
+    function currentDraft() {
+      return samples.get(currentItem().key) || { status: "pending", variants: [] };
+    }
+
+    function saveCurrent(shouldPersist = true) {
+      const item = currentItem();
+      const draft = currentDraft();
+      const strokes = normalizedStrokes(currentStrokes);
+      const previous = draft.variants[variantIndex];
+      if (hasInk(strokes)) {
+        // Preserve imported bounding boxes and points exactly when unedited.
+        if (!previous || JSON.stringify(previous.strokes) !== JSON.stringify(strokes)) {
+          draft.variants[variantIndex] = { baseline: 0, strokes, bbox: boundingBox(strokes), strokeCount: strokes.length, pointCount: pointCount(strokes) };
+        }
+      } else if (previous) {
+        draft.variants.splice(variantIndex, 1);
+        variantIndex = Math.min(variantIndex, draft.variants.length);
+      }
+      draft.status = draft.variants.length ? "complete" : (draft.status === "skipped" ? "skipped" : "pending");
+      samples.set(item.key, draft);
+      if (shouldPersist) persistSession();
+    }
+
+    function persistSession() {
+      if (!storageAvailable) return false;
+      const draftObject = {};
+      for (const item of items) {
+        const draft = samples.get(item.key);
+        if (draft) {
+          draftObject[item.key] = {
+            status: draft.status,
+            variants: draft.variants
+          };
+        }
+      }
+      try {
+        window.localStorage.setItem(STORAGE_KEY, JSON.stringify({
+          version: 2,
+          currentIndex,
+          samples: draftObject
+        }));
+        return true;
+      } catch (error) {
+        storageAvailable = false;
+        storageStatusElement.textContent = "Browser session storage became unavailable. Samples remain in this tab; export JSON before closing it.";
+        storageStatusElement.className = "storage-status warning";
+        return false;
+      }
+    }
+
+    function loadSession() {
+      if (!storageAvailable) return;
+      try {
+        const saved = JSON.parse(window.localStorage.getItem(STORAGE_KEY) || "null");
+        if (!saved || ![1, 2].includes(saved.version) || !saved.samples) return;
+        for (const item of items) {
+          const draft = saved.samples[item.key];
+          if (!draft) continue;
+          const variants = saved.version === 1
+            ? (hasInk(draft.strokes || []) ? [{ baseline: 0, strokes: draft.strokes, bbox: boundingBox(draft.strokes), strokeCount: draft.strokes.length, pointCount: pointCount(draft.strokes) }] : [])
+            : (draft.variants || []);
+          samples.set(item.key, { status: variants.length ? "complete" : (draft.status === "skipped" ? "skipped" : "pending"), variants });
+        }
+        if (Number.isInteger(saved.currentIndex)) {
+          currentIndex = Math.min(items.length - 1, Math.max(0, saved.currentIndex));
+        }
+      } catch (error) {
+        storageStatusElement.textContent = "The saved browser session could not be read; starting a fresh in-memory session.";
+        storageStatusElement.className = "storage-status warning";
+      }
+    }
+
+    function loadCurrent() {
+      activeStroke = null;
+      variantIndex = Math.min(variantIndex, currentDraft().variants.length);
+      currentStrokes = rawStrokes(currentDraft().variants[variantIndex]?.strokes || []);
+      renderCanvas();
+      updateUI();
+    }
+
+    function setNotice(message, type = "") {
+      noticeElement.textContent = message;
+      noticeElement.className = `notice ${type}`.trim();
+    }
+
+    function counts() {
+      let complete = 0;
+      let skipped = 0;
+      for (const item of items) {
+        const status = samples.get(item.key)?.status;
+        if (status === "complete") complete += 1;
+        if (status === "skipped") skipped += 1;
+      }
+      return { complete, skipped, missing: items.length - complete };
+    }
+
+    function updateUI() {
+      const item = currentItem();
+      const draft = currentDraft();
+      const totals = counts();
+      categoryElement.textContent = item.category;
+      previewElement.textContent = item.display;
+      previewElement.setAttribute("aria-label", `Preview for ${item.notation}`);
+      notationElement.textContent = item.kind === "command" ? item.notation : `Literal ${item.notation}`;
+      descriptionElement.textContent = item.description || (item.category === "Greek letters" ? "Greek letter" : "");
+      if (item.aliases.length > 0) {
+        descriptionElement.textContent += `${descriptionElement.textContent ? " · " : ""}Also used for ${item.aliases.join(", ")}`;
+      }
+      statusElement.textContent = `${draft.status === "complete" ? "Complete" : (draft.status === "skipped" ? "Skipped" : "Not started")} · variant ${variantIndex + 1} of ${Math.max(1, draft.variants.length)}`;
+      variantPrevious.disabled = variantIndex === 0;
+      variantNext.disabled = variantIndex >= draft.variants.length - 1;
+      variantAdd.disabled = draft.variants.length >= maxVariants(item) || !hasInk(currentStrokes);
+      statusElement.className = `status ${draft.status}`.trim();
+      progressBar.value = totals.complete;
+      progressBar.max = items.length;
+      progressLabel.textContent = `${totals.complete} of ${items.length} complete${totals.skipped ? ` · ${totals.skipped} skipped` : ""}`;
+      previousButton.disabled = currentIndex === 0;
+      nextButton.textContent = currentIndex === items.length - 1 ? "Save sample" : "Save sample & next";
+      undoButton.disabled = currentStrokes.length === 0 && !activeStroke;
+      skipButton.textContent = draft.status === "skipped" ? "Keep skipped" : "Skip";
+      document.title = `(${currentIndex + 1}/${items.length}) Draw ${item.notation} · Aspectwrite`;
+    }
+
+    function drawStroke(stroke, color) {
+      if (!stroke || stroke.length === 0) return;
+      context.strokeStyle = color;
+      context.fillStyle = color;
+      context.lineWidth = 3;
+      context.lineCap = "round";
+      context.lineJoin = "round";
+      if (stroke.length === 1) {
+        context.beginPath();
+        context.arc(stroke[0].x, stroke[0].y, 1.5, 0, Math.PI * 2);
+        context.fill();
+        return;
+      }
+      context.beginPath();
+      context.moveTo(stroke[0].x, stroke[0].y);
+      for (let i = 1; i < stroke.length; i += 1) {
+        context.lineTo(stroke[i].x, stroke[i].y);
+      }
+      context.stroke();
+    }
+
+    function renderCanvas() {
+      context.clearRect(0, 0, LOGICAL_WIDTH, LOGICAL_HEIGHT);
+      context.fillStyle = "#ffffff";
+      context.fillRect(0, 0, LOGICAL_WIDTH, LOGICAL_HEIGHT);
+
+      // These guides are visual only and are never included in a stroke list.
+      context.save();
+      context.lineWidth = 1;
+      context.setLineDash([7, 6]);
+      context.strokeStyle = "#d9e2ec";
+      for (const y of [BASELINE_Y - 130, BASELINE_Y - 70, BASELINE_Y + 50]) {
+        context.beginPath();
+        context.moveTo(0, y);
+        context.lineTo(LOGICAL_WIDTH, y);
+        context.stroke();
+      }
+      context.setLineDash([10, 5]);
+      context.strokeStyle = "#dc2626";
+      context.beginPath();
+      context.moveTo(0, BASELINE_Y);
+      context.lineTo(LOGICAL_WIDTH, BASELINE_Y);
+      context.stroke();
+      context.setLineDash([]);
+      context.fillStyle = "#b91c1c";
+      context.font = "14px system-ui, sans-serif";
+      context.fillText("baseline", 14, BASELINE_Y - 9);
+      context.restore();
+
+      for (const stroke of currentStrokes) drawStroke(stroke, "#182230");
+      if (activeStroke) drawStroke(activeStroke, "#0f766e");
+    }
+
+    function resizeCanvas() {
+      const ratio = Math.max(1, window.devicePixelRatio || 1);
+      canvas.width = LOGICAL_WIDTH * ratio;
+      canvas.height = LOGICAL_HEIGHT * ratio;
+      context.setTransform(ratio, 0, 0, ratio, 0, 0);
+      renderCanvas();
+    }
+
+    function canvasPoint(event) {
+      const rect = canvas.getBoundingClientRect();
+      return {
+        x: Math.min(LOGICAL_WIDTH, Math.max(0, (event.clientX - rect.left) * LOGICAL_WIDTH / rect.width)),
+        y: Math.min(LOGICAL_HEIGHT, Math.max(0, (event.clientY - rect.top) * LOGICAL_HEIGHT / rect.height))
+      };
+    }
+
+    function addPoint(event) {
+      if (!activeStroke) return;
+      const point = canvasPoint(event);
+      const previous = activeStroke[activeStroke.length - 1];
+      if (previous && Math.hypot(point.x - previous.x, point.y - previous.y) < .35) return;
+      activeStroke.push({
+        x: point.x,
+        y: point.y,
+        t: performance.now() - strokeStartTime,
+        p: event.pressure > 0 ? event.pressure : .5
+      });
+      renderCanvas();
+    }
+
+    function finishStroke(event) {
+      if (!activeStroke) return;
+      addPoint(event);
+      if (activeStroke.length > 0) currentStrokes.push(activeStroke);
+      activeStroke = null;
+      saveCurrent();
+      renderCanvas();
+      updateUI();
+    }
+
+    function goTo(index) {
+      saveCurrent();
+      currentIndex = Math.min(items.length - 1, Math.max(0, index));
+      variantIndex = 0;
+      persistSession();
+      loadCurrent();
+      setNotice("");
+    }
+
+    function goNext() {
+      saveCurrent();
+      if (currentIndex < items.length - 1) {
+        currentIndex += 1;
+        variantIndex = 0;
+        persistSession();
+        loadCurrent();
+        setNotice("");
+      } else {
+        updateUI();
+        const totals = counts();
+        setNotice(totals.complete === items.length
+          ? "Every glyph is complete. Export the JSON stroke file when ready."
+          : `${totals.missing} glyph${totals.missing === 1 ? " is" : "s are"} still missing. You can export now or continue from Previous.`,
+          totals.complete === items.length ? "success" : "");
+      }
+    }
+
+    function skipCurrent() {
+      if (!window.confirm("Skip this glyph and delete all its variants?")) return;
+      activeStroke = null;
+      currentStrokes = [];
+      variantIndex = 0;
+      samples.set(currentItem().key, { status: "skipped", variants: [] });
+      persistSession();
+      if (currentIndex < items.length - 1) {
+        currentIndex += 1;
+        variantIndex = 0;
+        persistSession();
+        loadCurrent();
+        setNotice("");
+      } else {
+        renderCanvas();
+        updateUI();
+        setNotice("This glyph is marked skipped. Use Previous to return to it.");
+      }
+    }
+
+    function clearCurrent() {
+      if (!window.confirm("Clear this variant?")) return;
+      activeStroke = null;
+      currentStrokes = [];
+      const draft = currentDraft();
+      draft.variants.splice(variantIndex, 1);
+      samples.set(currentItem().key, { status: draft.variants.length ? "complete" : "pending", variants: draft.variants });
+      variantIndex = Math.min(variantIndex, Math.max(0, draft.variants.length - 1));
+      persistSession();
+      loadCurrent();
+      renderCanvas();
+      updateUI();
+      setNotice("Current sample cleared.");
+    }
+
+    function undoStroke() {
+      if (activeStroke) {
+        activeStroke = null;
+      } else {
+        currentStrokes.pop();
+      }
+      saveCurrent();
+      renderCanvas();
+      updateUI();
+      setNotice("");
+    }
+
+    function exportData() {
+      // Export must never depend on browser storage. This is important for
+      // file:// pages, where storage is commonly disabled.
+      saveCurrent(false);
+      const glyphs = items.map(item => {
+        const draft = samples.get(item.key) || { status: "pending", variants: [] };
+        const variants = draft.variants;
+        const complete = variants.length > 0;
+        return {
+          key: item.key,
+          label: item.display,
+          notation: item.notation,
+          category: item.category,
+          aliases: item.aliases,
+          description: item.description,
+          status: complete ? "complete" : (draft.status === "skipped" ? "skipped" : "missing"),
+          baseline: 0,
+          variants
+        };
+      });
+      return {
+        schema: "aspectwrite.handwriting",
+        version: 2,
+        exportedAt: new Date().toISOString(),
+        coordinateSystem: {
+          units: "logical-canvas-pixels",
+          origin: "left edge at baseline",
+          xPositive: "right",
+          yPositive: "up",
+          baseline: 0,
+          sourceCanvas: {
+            width: LOGICAL_WIDTH,
+            height: LOGICAL_HEIGHT,
+            baselineY: BASELINE_Y
+          }
+        },
+        glyphCount: glyphs.length,
+        complete: glyphs.every(glyph => glyph.status === "complete"),
+        glyphs
+      };
+    }
+
+    function exportTextFor(data) {
+      return JSON.stringify(data, null, 2);
+    }
+
+    function showExportText(text) {
+      exportText.value = text;
+      exportText.classList.add("visible");
+    }
+
+    function exportSnapshot() {
+      const data = exportData();
+      const text = exportTextFor(data);
+      showExportText(text);
+      return { data, text };
+    }
+
+    function downloadJson() {
+      const { data, text } = exportSnapshot();
+      const missing = data.glyphs.filter(glyph => glyph.status !== "complete").length;
+      if (missing > 0 && !window.confirm(`${missing} glyph${missing === 1 ? " is" : "s are"} incomplete. Export anyway?`)) {
+        setNotice("Export cancelled; the JSON is still available below.");
+        return;
+      }
+      // This path intentionally does not touch localStorage. It works for a
+      // file:// page even when browser session storage is blocked.
+      const blob = new Blob([text], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = "aspectwrite-strokes.json";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+      setNotice("Stroke JSON downloaded. A copy remains available below.", "success");
+    }
+
+    async function copyJson() {
+      const { data, text } = exportSnapshot();
+      const missing = data.glyphs.filter(glyph => glyph.status !== "complete").length;
+      if (missing > 0 && !window.confirm(`${missing} glyph${missing === 1 ? " is" : "s are"} incomplete. Copy anyway?`)) {
+        setNotice("Copy cancelled; the JSON is still available below.");
+        return;
+      }
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(text);
+        } else {
+          exportText.focus();
+          exportText.select();
+          if (!document.execCommand("copy")) throw new Error("Clipboard copy failed");
+        }
+        setNotice("Stroke JSON copied to the clipboard.", "success");
+      } catch (error) {
+        exportText.focus();
+        exportText.select();
+        setNotice("Clipboard access was blocked; the JSON is selected below. Press Ctrl+C to copy it.");
+      }
+    }
+
+    function importData(data) {
+      if (!data || data.schema !== "aspectwrite.handwriting" || ![1, 2].includes(data.version) || !Array.isArray(data.glyphs)) {
+        throw new Error("This is not an aspectwrite handwriting file (version 1 or 2).");
+      }
+      if (samples.size && !window.confirm("Import replaces current samples. Export a backup first. Continue?")) return;
+      let imported = 0;
+      const pending = new Map();
+      for (const glyph of data.glyphs) {
+        const item = keyToItem.get(glyph.key);
+        if (!item) continue;
+        const variants = data.version === 1
+          ? (hasInk(glyph.strokes || []) ? [{ baseline: glyph.baseline, strokes: glyph.strokes, bbox: glyph.bbox, strokeCount: glyph.strokeCount, pointCount: glyph.pointCount }] : [])
+          : glyph.variants;
+        if (!Array.isArray(variants) || variants.length > maxVariants(item) || variants.some(v => !Array.isArray(v.strokes))) throw new Error(`Invalid variants for ${item.key}`);
+        if (pending.has(item.key)) throw new Error(`Duplicate glyph ${item.key}`);
+        pending.set(item.key, {
+          status: variants.length ? "complete" : (glyph.status === "skipped" ? "skipped" : "pending"),
+          variants
+        });
+        imported += 1;
+      }
+      if (imported === 0) throw new Error("The file did not contain any known glyphs.");
+      for (const [key, value] of pending) samples.set(key, value);
+      variantIndex = 0;
+      const firstMissing = items.findIndex(item => {
+        const draft = samples.get(item.key);
+        return !draft || !draft.variants.length;
+      });
+      if (firstMissing >= 0) currentIndex = firstMissing;
+      persistSession();
+      loadCurrent();
+      setNotice(`Imported ${imported} glyph sample${imported === 1 ? "" : "s"}; showing the first missing glyph.`, "success");
+    }
+
+    function resetAll() {
+      if (!window.confirm("Delete every collected sample from this browser?")) return;
+      samples.clear();
+      currentIndex = 0;
+      currentStrokes = [];
+      activeStroke = null;
+      try { window.localStorage.removeItem(STORAGE_KEY); } catch (error) { /* ignore */ }
+      loadCurrent();
+      setNotice("All samples were reset.");
+    }
+
+    canvas.addEventListener("pointerdown", event => {
+      if (event.button !== undefined && event.button !== 0) return;
+      event.preventDefault();
+      canvas.setPointerCapture(event.pointerId);
+      activeStroke = [];
+      strokeStartTime = performance.now();
+      addPoint(event);
+      updateUI();
+    });
+    canvas.addEventListener("pointermove", event => {
+      if (!activeStroke) return;
+      event.preventDefault();
+      addPoint(event);
+    });
+    canvas.addEventListener("pointerup", event => {
+      event.preventDefault();
+      finishStroke(event);
+      if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+    });
+    canvas.addEventListener("pointercancel", event => {
+      if (activeStroke) {
+        activeStroke = null;
+        renderCanvas();
+        updateUI();
+      }
+      if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+    });
+
+    previousButton.addEventListener("click", () => goTo(currentIndex - 1));
+    variantPrevious.addEventListener("click", () => { saveCurrent(); variantIndex--; loadCurrent(); });
+    variantNext.addEventListener("click", () => { saveCurrent(); variantIndex++; loadCurrent(); });
+    variantAdd.addEventListener("click", () => { saveCurrent(); if (currentDraft().variants.length < maxVariants(currentItem()) && hasInk(currentStrokes)) { variantIndex = currentDraft().variants.length; loadCurrent(); } });
+    undoButton.addEventListener("click", undoStroke);
+    clearButton.addEventListener("click", clearCurrent);
+    skipButton.addEventListener("click", skipCurrent);
+    nextButton.addEventListener("click", goNext);
+    exportButton.addEventListener("click", downloadJson);
+    copyButton.addEventListener("click", copyJson);
+    resetButton.addEventListener("click", resetAll);
+    importButton.addEventListener("click", () => importFile.click());
+    importFile.addEventListener("change", async () => {
+      const file = importFile.files && importFile.files[0];
+      if (!file) return;
+      try {
+        importData(JSON.parse(await file.text()));
+      } catch (error) {
+        setNotice(error.message || "Could not import that file.", "error");
+      } finally {
+        importFile.value = "";
+      }
+    });
+
+    document.addEventListener("keydown", event => {
+      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return;
+      if (event.key === "ArrowLeft" && currentIndex > 0) {
+        event.preventDefault();
+        goTo(currentIndex - 1);
+      } else if (event.key === "ArrowRight") {
+        event.preventDefault();
+        goNext();
+      } else if (event.key === "Backspace") {
+        event.preventDefault();
+        undoStroke();
+      }
+    });
+
+    formatPreview.textContent = JSON.stringify({
+      schema: "aspectwrite.handwriting",
+      version: 2,
+      coordinateSystem: { baseline: 0, yPositive: "up" },
+      glyph: {
+        key: "A",
+        aliases: [],
+        description: "",
+        status: "complete",
+        baseline: 0,
+        variants: [{ baseline: 0, strokes: [[{ x: 12, y: 68, t: 0, p: .5 }]], bbox: { minX: 12, minY: 68, maxX: 12, maxY: 68, width: 0, height: 0 } }]
+      }
+    }, null, 2);
+
+    initializeStorage();
+    loadSession();
+    resizeCanvas();
+    loadCurrent();
+    window.addEventListener("resize", resizeCanvas);
+    window.addEventListener("beforeunload", event => {
+      if (!storageAvailable && counts().complete > 0) {
+        event.preventDefault();
+        event.returnValue = "Export your handwriting JSON before leaving this page.";
+      }
+    });
+  </script>
+</body>
+</html>

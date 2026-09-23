@@ -1,0 +1,17 @@
+Implement an MCP server which renders LaTeX into an image, in the style of the user's handwriting. Implement it in these phases:
+
+PHASE ONE
+
+Define a subset of LaTeX to implement. Make sure this subset can support physics/thermodynamics expressions with units, calculus/differential equations expressions, chemical equations with subscripts and superscripts, and regular prose.
+
+PHASE TWO
+
+Implement a handwriting collector. Implement it as a basic, self-contained HTML file which prompts the user to draw each letter in the alphabet, each number, and each symbol (including math symbols, like integrals). Don't include symbols that may need to be dynamic, like parentheses and brackets, which may require variable height. Once the user finishes, allow them to export a file containing the stroke data.
+
+PHASE THREE
+
+Implement the LaTeX parser. You may use an external crate to parse the LaTeX, but consider that only the subset you picked in phase one should be parsed, and an LLM can be instructed to stick to said subset.
+
+PHASE FOUR
+
+Implement the renderer. Given a request, the program should parse the given LaTeX, lay it out, draw it 

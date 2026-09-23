@@ -1,0 +1,13 @@
+# Handwriting stroke file (v2)
+
+Open `handwriting-collector.html` locally. Import an existing v1 export with **Import JSON**, then export a **new file**; never overwrite the only copy of an old export. To use the renderer, export a profile JSON and pass its path to the CLI or MCP server. Keep an external backup before clearing or importing over a session. The collector keeps the old localStorage key and reads v1 sessions, upgrading only when it saves. Export works without localStorage: **Export JSON** downloads a Blob and leaves the full JSON in a copyable textarea; **Copy JSON** also fills that textarea.
+
+Schema `aspectwrite.handwriting`, `version: 2`. Top-level `coordinateSystem`, `exportedAt`, `glyphCount`, `complete` and `glyphs` have the same meanings as v1. Source canvas is 800 × 320, baseline at source y=220. Point `x` goes right; exported `y` goes **up** from the baseline; `t` is milliseconds into the stroke; `p` is pressure in [0,1]. Guides are never exported.
+
+Each glyph has `key`, `label`, `notation`, `category`, `aliases`, `description`, `status` (`complete`, `missing`, or `skipped`), `baseline: 0`, and `variants`. Each variant has its own `baseline: 0`, `strokes` (arrays of `{x,y,t,p}` points), `bbox` (`minX`, `minY`, `maxX`, `maxY`, `width`, `height`), `strokeCount` and `pointCount`. `variants: []` means no ink. For example:
+
+```json
+{"schema":"aspectwrite.handwriting","version":2,"glyphs":[{"key":"a","status":"complete","baseline":0,"variants":[{"baseline":0,"strokes":[[{"x":12,"y":68,"t":0,"p":0.5}]],"bbox":{"minX":12,"minY":68,"maxX":12,"maxY":68,"width":0,"height":0},"strokeCount":1,"pointCount":1}]}]}
+```
+
+Latin letters and digits may have 1–3 samples; other symbols need one. Use **Add variant**, **Previous variant** and **Next variant** in the collector. Clearing a variant or skipping a glyph prompts for confirmation. A v1 glyph's original strokes, baseline and bounding box become variant 0 without recollection; incomplete glyphs stay incomplete. v1 files are still accepted directly by the renderer. Rendering cycles through variants of a glyph by occurrence, with an optional seed selecting the starting variant. One variant is enough; stroke thickness is uniform regardless of sample or scale. Aliases and procedural delimiters follow `docs/latex-subset.md`.
