@@ -146,6 +146,7 @@ const UNIT: f32 = 0.48; // 145 source-pixel capital -> 70 output pixels
 const GAP: f32 = 4.5;
 const TEXT_GAP: f32 = 6.5;
 const DIGIT_GAP: f32 = 9.0;
+const DECIMAL_POINT_GAP: f32 = 12.0;
 const ALIGNED_ROW_GAP: f32 = 36.0;
 const FRACTION_EXTRA_WIDTH: f32 = 30.0;
 const FRACTION_EXTRA_WIDTH_VARIATION: f32 = 8.0;
@@ -632,6 +633,17 @@ struct Layout<'a> {
     placed: usize,
 }
 impl Layout<'_> {
+    fn digit_glyph(node: &Node) -> bool {
+        matches!(node, Node::Glyph(key) if key.len() == 1 && key.as_bytes()[0].is_ascii_digit())
+    }
+
+    fn decimal_point_at(nodes: &[Node], index: usize) -> bool {
+        index > 0
+            && matches!(nodes.get(index), Some(Node::Glyph(key)) if key == ".")
+            && nodes.get(index - 1).is_some_and(Self::digit_glyph)
+            && nodes.get(index + 1).is_some_and(Self::digit_glyph)
+    }
+
     /// Relations and fraction bars belong on the user's math axis, not the
     /// writing baseline. Measure it from the center of their '=' sample.
     fn math_axis(&self) -> f32 {
@@ -873,10 +885,17 @@ impl Layout<'_> {
                         }
                         _ => 0.0,
                     };
+                    let decimal_gap = if Self::decimal_point_at(nodes, i)
+                        || (i > 0 && Self::decimal_point_at(nodes, i - 1))
+                    {
+                        DECIMAL_POINT_GAP
+                    } else {
+                        0.0
+                    };
                     out.above = out.above.max(b.above);
                     out.below = out.below.max(b.below);
                     out.script_drop = out.script_drop.max(b.script_drop);
-                    let x = out.width + pad + group_gap + digit_gap;
+                    let x = out.width + pad + group_gap + digit_gap + decimal_gap;
                     out.width = x + b.width + pad;
                     out.add(b.translated(x, 0.0));
                 }
@@ -1184,7 +1203,8 @@ impl Layout<'_> {
         let mut out = Box2::empty();
         let mut word: Vec<(Box2, f32)> = Vec::new();
         let mut previous_char = None;
-        for ch in text.chars() {
+        let chars: Vec<char> = text.chars().collect();
+        for (i, ch) in chars.iter().copied().enumerate() {
             let b = if ch == ' ' {
                 Box2 {
                     width: 24.0,
@@ -1200,6 +1220,17 @@ impl Layout<'_> {
             let mut x = out.width;
             if ch.is_ascii_digit() && previous_char.is_some_and(|c: char| c.is_ascii_digit()) {
                 x += DIGIT_GAP;
+            }
+            if (ch == '.'
+                && i > 0
+                && chars[i - 1].is_ascii_digit()
+                && chars.get(i + 1).is_some_and(char::is_ascii_digit))
+                || (ch.is_ascii_digit()
+                    && i >= 2
+                    && chars[i - 1] == '.'
+                    && chars[i - 2].is_ascii_digit())
+            {
+                x += DECIMAL_POINT_GAP;
             }
             if ch.is_ascii_alphabetic()
                 && let Some((prior, prior_x)) = word.last()
@@ -1577,6 +1608,37 @@ mod tests {
         );
         assert!(
             (layout.layout(&parse("xx").unwrap()).unwrap().width - 2.0 * letter_width).abs() < 0.01
+        );
+    }
+
+    #[test]
+    fn decimal_points_have_extra_space_only_inside_numbers() {
+        let mut hand = fixture();
+        hand.glyphs.insert(
+            ".".into(),
+            serde_json::from_value(serde_json::json!({
+                "key":".", "status":"complete",
+                "bbox":{"minX":0,"maxX":5,"minY":0,"maxY":5},
+                "strokes":[[{"x":0,"y":5},{"x":5,"y":0}]]
+            }))
+            .unwrap(),
+        );
+        let mut layout = Layout {
+            hand: &hand,
+            seed: 0,
+            occurrences: HashMap::new(),
+            variation: false,
+            placed: 0,
+        };
+        let digit_width = layout.glyph("1").unwrap().width;
+        let letter_width = layout.glyph("x").unwrap().width;
+        let period_width = layout.glyph(".").unwrap().width;
+        let number_width = 2.0 * digit_width + period_width + 2.0 * DECIMAL_POINT_GAP;
+        assert!((layout.layout(&parse("1.1").unwrap()).unwrap().width - number_width).abs() < 0.01);
+        assert!((layout.text("1.1").unwrap().width - number_width).abs() < 0.01);
+        // A prose period between letters is not a decimal point.
+        assert!(
+            (layout.text("x.x").unwrap().width - (2.0 * letter_width + period_width)).abs() < 0.01
         );
     }
 
