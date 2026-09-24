@@ -316,11 +316,11 @@ fn pressure_width(pressure: f32) -> f32 {
 // occurrence count. It must never depend on wall-clock time or on HashMap
 // iteration order, which Rust randomizes per process, or a fixed seed would
 // stop producing byte-identical output.
-const MAX_INSTANCE_ROTATION: f32 = 0.8 * std::f32::consts::PI / 180.0;
-const MAX_INSTANCE_SCALE: f32 = 0.02;
-const MAX_INSTANCE_BASELINE_OFFSET: f32 = 1.5;
-const MIN_INSTANCE_PRESSURE: f32 = 0.88;
-const MAX_INSTANCE_PRESSURE: f32 = 1.12;
+const MAX_INSTANCE_ROTATION: f32 = 1.6 * std::f32::consts::PI / 180.0;
+const MAX_INSTANCE_SCALE: f32 = 0.045;
+const MAX_INSTANCE_BASELINE_OFFSET: f32 = 3.0;
+const MIN_INSTANCE_PRESSURE: f32 = 0.78;
+const MAX_INSTANCE_PRESSURE: f32 = 1.28;
 
 fn mix64(mut bits: u64) -> u64 {
     bits ^= bits >> 30;
@@ -356,7 +356,7 @@ fn unit_signed(bits: u64) -> f32 {
 fn baseline_drift(seed: u64, placed: usize) -> f32 {
     let phase = (seed % 997) as f32 * 0.017;
     let index = placed as f32;
-    0.9 * (index * 0.23 + phase).sin() + 0.5 * (index * 0.41 + phase * 1.7).sin()
+    1.8 * (index * 0.23 + phase).sin() + 0.9 * (index * 0.41 + phase * 1.7).sin()
 }
 
 struct InstanceVariation {
@@ -396,6 +396,32 @@ impl InstanceVariation {
 
 fn is_delimiter(key: &str) -> bool {
     matches!(key, "(" | ")" | "[" | "]" | "|")
+}
+
+const HAND_DRAWN_LINE_SEGMENTS: usize = 8;
+const MAX_LINE_WAVE: f32 = 0.9;
+const MAX_LINE_TILT: f32 = 0.9;
+
+/// A hand-drawn straight line: a slight wave and tilt that fade to nothing at
+/// the endpoints, so the line still spans exactly the same two points.
+fn hand_drawn_line(seed: u64, placed: usize, from: (f32, f32), to: (f32, f32)) -> Vec<(f32, f32)> {
+    let bits = instance_bits(seed, "\\fracbar", placed);
+    let phase_a = unit_interval(bits) * std::f32::consts::TAU;
+    let phase_b = unit_interval(mix64(bits.rotate_left(23))) * std::f32::consts::TAU;
+    let tilt = MAX_LINE_TILT * unit_signed(mix64(bits.rotate_left(37)));
+    (0..=HAND_DRAWN_LINE_SEGMENTS)
+        .map(|index| {
+            let t = index as f32 / HAND_DRAWN_LINE_SEGMENTS as f32;
+            let envelope = (std::f32::consts::PI * t).sin();
+            let wave = envelope
+                * (MAX_LINE_WAVE * (t * 5.3 + phase_a).sin()
+                    + 0.5 * MAX_LINE_WAVE * (t * 9.1 + phase_b).sin());
+            (
+                from.0 + (to.0 - from.0) * t,
+                from.1 + (to.1 - from.1) * t + wave + (t - 0.5) * tilt,
+            )
+        })
+        .collect()
 }
 
 pub fn png(node: &Node, handwriting: &Handwriting) -> Result<Vec<u8>> {
@@ -542,6 +568,13 @@ impl Layout<'_> {
         }
     }
 
+    /// Monotonic count of glyphs placed so far, in layout order.
+    fn next_placement(&mut self) -> usize {
+        let placed = self.placed;
+        self.placed += 1;
+        placed
+    }
+
     fn glyph(&mut self, key: &str) -> Result<Box2> {
         // Use collected parentheses when available; other literal delimiters
         // (and parentheses in older profiles) remain procedural.
@@ -636,12 +669,12 @@ impl Layout<'_> {
         } else {
             None
         };
+        let placed = self.next_placement();
         let drift = if self.variation {
-            baseline_drift(self.seed, self.placed)
+            baseline_drift(self.seed, placed)
         } else {
             0.0
         };
-        self.placed += 1;
 
         let mut raw: Vec<RawStroke> = Vec::new();
         let mut ink_min_x = f32::INFINITY;
@@ -757,7 +790,17 @@ impl Layout<'_> {
                 let bx = (width - bottom.width) / 2.0;
                 out.add(top.translated(tx, ty));
                 out.add(bottom.translated(bx, by));
-                out.line(vec![(2.0, axis), (width - 2.0, axis)]);
+                let bar = if self.variation {
+                    hand_drawn_line(
+                        self.seed,
+                        self.next_placement(),
+                        (2.0, axis),
+                        (width - 2.0, axis),
+                    )
+                } else {
+                    vec![(2.0, axis), (width - 2.0, axis)]
+                };
+                out.line(bar);
                 Ok(out)
             }
             Node::Root(index, body) => {
@@ -1183,6 +1226,40 @@ mod tests {
         assert!(
             (1.0..1.3).contains(&ratio),
             "fraction/full digit height: {ratio}"
+        );
+        // Without variation the bar is a plain two-point line.
+        assert_eq!(bar.points.len(), 2);
+    }
+
+    #[test]
+    fn fraction_bars_are_hand_drawn_when_variation_is_on() {
+        let hand = fixture();
+        let bar = |seed| {
+            let mut layout = varied(&hand, seed);
+            let fraction = layout.layout(&parse(r"\frac{1}{1}").unwrap()).unwrap();
+            fraction
+                .marks
+                .iter()
+                .find(|mark| mark.points.len() == HAND_DRAWN_LINE_SEGMENTS + 1)
+                .map(|mark| mark.points.clone())
+                .expect("a wavy fraction bar")
+        };
+        let first = bar(0);
+        assert_eq!(first, bar(0), "the bar must be reproducible per seed");
+        assert_ne!(first, bar(1), "the bar must differ between seeds");
+
+        let (from, to) = (first[0], first[first.len() - 1]);
+        assert!((from.0 - 2.0).abs() < 0.01, "the bar must start at 2.0");
+        let mut largest = 0.0f32;
+        for (index, point) in first.iter().enumerate() {
+            let t = index as f32 / (first.len() - 1) as f32;
+            let chord = from.1 + (to.1 - from.1) * t;
+            largest = largest.max((point.1 - chord).abs());
+        }
+        assert!(largest > 0.2, "the bar is still straight: {largest}");
+        assert!(
+            largest <= MAX_LINE_WAVE * 1.5,
+            "the bar waves too much: {largest}"
         );
     }
 
@@ -1624,20 +1701,28 @@ mod tests {
             plain.glyph("x").unwrap().marks[0].points.clone()
         };
         let mut moved = 0;
+        let mut largest = 0.0f32;
         for seed in 0..64 {
             let varied_points = varied(&hand, seed).glyph("x").unwrap().marks[0]
                 .points
                 .clone();
             for (before, after) in base.iter().zip(&varied_points) {
                 let (dx, dy) = ((after.0 - before.0).abs(), (after.1 - before.1).abs());
-                assert!(dx <= 2.0, "horizontal jitter {dx} is too large");
-                assert!(dy <= 5.0, "vertical jitter {dy} is too large");
+                assert!(dx <= 5.0, "horizontal jitter {dx} is too large");
+                assert!(dy <= 10.0, "vertical jitter {dy} is too large");
                 if dx > 0.01 || dy > 0.01 {
                     moved += 1;
                 }
+                largest = largest.max(dx).max(dy);
             }
         }
         assert!(moved > 0, "variation never moved any point");
+        // A jitter this small is invisible on a real glyph, which is how an
+        // earlier version of this feature shipped without any visible effect.
+        assert!(
+            largest >= 1.5,
+            "variation is too small to notice: largest displacement {largest}"
+        );
     }
 
     #[test]
