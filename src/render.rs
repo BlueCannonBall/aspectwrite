@@ -125,7 +125,7 @@ const GAP: f32 = 4.5;
 const TEXT_GAP: f32 = 6.5;
 const DIGIT_GAP: f32 = 9.0;
 // Geometry may shrink for scripts and fractions, but ink width never does.
-const INK_WIDTH: f32 = 1.7;
+const INK_WIDTH: f32 = 2.3;
 #[derive(Clone)]
 struct Mark {
     points: Vec<(f32, f32)>,
@@ -308,8 +308,10 @@ fn vary_parenthesis(mark: &mut Mark) {
 }
 
 fn pressure_width(pressure: f32) -> f32 {
+    // Keep light-pressure strokes legible while retaining a modest pressure
+    // response. At the usual 0.5 mouse/default pressure this matches INK_WIDTH.
     let p = pressure.clamp(0.0, 1.0);
-    0.35 + 1.15 * p + 1.55 * p * p
+    2.0 + 0.6 * p
 }
 
 // Per-instance variation is derived only from the seed, the glyph key and the
@@ -773,12 +775,11 @@ impl Layout<'_> {
                 let bottom = self.layout(b)?.scaled(0.55);
                 let width = top.width.max(bottom.width) + 14.0;
                 let axis = -self.math_axis();
-                // Let long descenders extend slightly through the bar, while
-                // retaining separation from the denominator below it.
-                let numerator_descender_offset = top.below.min(8.0);
-                let ty = axis - 4.5 - top.below + numerator_descender_offset;
-                let by =
-                    axis + 4.5 + bottom.above + (numerator_descender_offset - 4.5).max(0.0) * 1.5;
+                // Keep all numerator ink, including subscripts and descenders,
+                // clear of the bar's hand-drawn wobble and stroke width.
+                const FRACTION_CLEARANCE: f32 = 6.0;
+                let ty = axis - FRACTION_CLEARANCE - top.below;
+                let by = axis + FRACTION_CLEARANCE + bottom.above;
                 let mut out = Box2 {
                     width,
                     above: (-ty + top.above).max(0.0),
@@ -1224,7 +1225,7 @@ mod tests {
         let ratio =
             (small_fraction.above + small_fraction.below) / (full_digit.above + full_digit.below);
         assert!(
-            (1.0..1.3).contains(&ratio),
+            (1.0..1.4).contains(&ratio),
             "fraction/full digit height: {ratio}"
         );
         // Without variation the bar is a plain two-point line.
@@ -1264,7 +1265,7 @@ mod tests {
     }
 
     #[test]
-    fn numerator_descenders_can_extend_below_the_fraction_bar() {
+    fn numerator_descenders_and_subscripts_stay_clear_of_fraction_bar() {
         let mut hand = fixture();
         let glyph: Glyph = serde_json::from_value(serde_json::json!({
             "key":"g", "status":"complete",
@@ -1273,19 +1274,34 @@ mod tests {
         }))
         .unwrap();
         hand.glyphs.insert("g".into(), glyph);
-        let mut layout = Layout {
-            hand: &hand,
-            seed: 0,
-            occurrences: HashMap::new(),
-            variation: false,
-            placed: 0,
-        };
-        let with_descender = layout.layout(&parse(r"\frac{g}{1}").unwrap()).unwrap();
-        let ordinary = layout.layout(&parse(r"\frac{1}{1}").unwrap()).unwrap();
-        let bar_y = with_descender.marks[2].points[0].1;
-        assert!(with_descender.marks[0].points[1].1 > bar_y);
-        assert!(with_descender.marks[1].points[0].1 > with_descender.marks[0].points[1].1);
-        assert!(ordinary.marks[0].points[1].1 < ordinary.marks[2].points[0].1);
+
+        for expression in [r"\frac{g}{1}", r"\frac{x_{1}}{1}"] {
+            for seed in 0..32 {
+                let mut layout = varied(&hand, seed);
+                let fraction = layout.layout(&parse(expression).unwrap()).unwrap();
+                let bar_index = fraction
+                    .marks
+                    .iter()
+                    .position(|mark| mark.points.len() == HAND_DRAWN_LINE_SEGMENTS + 1)
+                    .expect("hand-drawn fraction bar");
+                let numerator_mark_count = if expression.contains("x_{1}") { 2 } else { 1 };
+                let numerator_bottom = fraction.marks[..numerator_mark_count]
+                    .iter()
+                    .flat_map(|mark| &mark.points)
+                    .map(|point| point.1)
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let bar_top = fraction.marks[bar_index]
+                    .points
+                    .iter()
+                    .map(|point| point.1)
+                    .fold(f32::INFINITY, f32::min);
+                assert!(
+                    bar_top - numerator_bottom >= 2.5,
+                    "{expression}, seed {seed}: numerator/bar gap = {}",
+                    bar_top - numerator_bottom
+                );
+            }
+        }
     }
 
     #[test]
@@ -1640,10 +1656,10 @@ mod tests {
             layout.glyph("x").unwrap().marks[0].pressures,
             Some(vec![0.1, 0.9])
         );
-        assert!(pressure_width(0.1) < 0.6);
-        assert!(pressure_width(0.6) < 1.7);
-        assert!(pressure_width(0.9) > 2.5);
-        assert!(pressure_width(1.0) > 3.0);
+        assert!(pressure_width(0.0) >= 2.0);
+        assert!((pressure_width(0.5) - INK_WIDTH).abs() < 0.001);
+        assert!(pressure_width(0.9) > pressure_width(0.1));
+        assert!(pressure_width(1.0) <= 2.6);
         assert_eq!(layout.glyph("T").unwrap().marks[0].pressures, None);
     }
 
