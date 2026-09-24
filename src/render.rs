@@ -146,6 +146,12 @@ const UNIT: f32 = 0.48; // 145 source-pixel capital -> 70 output pixels
 const GAP: f32 = 4.5;
 const TEXT_GAP: f32 = 6.5;
 const DIGIT_GAP: f32 = 9.0;
+const ALIGNED_ROW_GAP: f32 = 36.0;
+const FRACTION_EXTRA_WIDTH: f32 = 30.0;
+const FRACTION_EXTRA_WIDTH_VARIATION: f32 = 8.0;
+const PARENTHESIS_WIDTH_VARIATION: f32 = 0.18;
+const PARENTHESIS_LEAN: f32 = 2.0;
+const PARENTHESIS_BOW_VARIATION: f32 = 3.5;
 // Geometry may shrink for scripts and fractions, but ink width never does.
 const INK_WIDTH: f32 = 2.3;
 
@@ -879,7 +885,13 @@ impl Layout<'_> {
             Node::Fraction(a, b) => {
                 let top = self.layout(a)?.scaled(0.55);
                 let bottom = self.layout(b)?.scaled(0.55);
-                let width = top.width.max(bottom.width) + 14.0;
+                let extra_width = if self.variation {
+                    FRACTION_EXTRA_WIDTH_VARIATION
+                        * unit_signed(instance_bits(self.seed, "\\frac-width", self.placed))
+                } else {
+                    0.0
+                };
+                let width = top.width.max(bottom.width) + FRACTION_EXTRA_WIDTH + extra_width;
                 let axis = -self.math_axis();
                 // The bar is the writing line for the numerator: put the
                 // numerator's own baseline, or its deepest subscript baseline,
@@ -1085,11 +1097,11 @@ impl Layout<'_> {
                 let left_slot = self
                     .hand
                     .recorded_parenthesis_width(left)
-                    .map_or(20.0, |w| (w + 6.0).max(20.0));
+                    .map_or(20.0, |w| (w + 6.0 + PARENTHESIS_BOW_VARIATION).max(20.0));
                 let right_slot = self
                     .hand
                     .recorded_parenthesis_width(right)
-                    .map_or(20.0, |w| (w + 6.0).max(20.0));
+                    .map_or(20.0, |w| (w + 6.0 + PARENTHESIS_BOW_VARIATION).max(20.0));
                 let mut out = Box2 {
                     width: b.width + left_slot + right_slot,
                     above,
@@ -1148,7 +1160,11 @@ impl Layout<'_> {
                 for (i, (a, b)) in layouts.into_iter().enumerate() {
                     let above = a.above.max(b.as_ref().map_or(0.0, |b| b.above));
                     let below = a.below.max(b.as_ref().map_or(0.0, |b| b.below));
-                    cursor += if i == 0 { above } else { above + 17.0 };
+                    cursor += if i == 0 {
+                        above
+                    } else {
+                        above + ALIGNED_ROW_GAP
+                    };
                     let baseline = cursor;
                     let x = left_w - a.width;
                     out.add(a.translated(x, baseline));
@@ -1244,12 +1260,34 @@ impl Layout<'_> {
                     "parenthesis {token} needs a stroke with vertical height"
                 )));
             }
-            let scale_y = (bot - top) / (max_y - min_y);
             let start_x = if opening { x - width } else { x };
+            // Keep collected parentheses within their reserved slots while
+            // allowing each occurrence a little more/less curvature and lean.
+            let bits = instance_bits(self.seed, token, self.placed);
+            let width_scale = if self.variation {
+                1.0 + PARENTHESIS_WIDTH_VARIATION * unit_signed(bits)
+            } else {
+                1.0
+            };
+            let lean = if self.variation {
+                PARENTHESIS_LEAN * unit_signed(mix64(bits.rotate_left(29)))
+            } else {
+                0.0
+            };
+            let bow = if self.variation {
+                PARENTHESIS_BOW_VARIATION * unit_signed(mix64(bits.rotate_left(11)))
+            } else {
+                0.0
+            };
             for mark in &mut sample.marks {
                 for point in &mut mark.points {
-                    point.0 += start_x;
-                    point.1 = top + (point.1 - min_y) * scale_y;
+                    let t = (point.1 - min_y) / (max_y - min_y);
+                    point.0 = start_x
+                        + width * 0.5
+                        + (point.0 - width * 0.5) * width_scale
+                        + (t - 0.5) * lean
+                        + if opening { -1.0 } else { 1.0 } * bow * (std::f32::consts::PI * t).sin();
+                    point.1 = top + t * (bot - top);
                 }
             }
             out.add(sample);
@@ -1393,6 +1431,58 @@ mod tests {
             largest <= MAX_LINE_WAVE * 1.5,
             "the bar waves too much: {largest}"
         );
+    }
+
+    #[test]
+    fn fraction_overhang_varies_but_clears_its_contents() {
+        let hand = fixture();
+        let mut widths = Vec::new();
+        for seed in 0..32 {
+            let fraction = varied(&hand, seed)
+                .layout(&parse(r"\frac{1}{1}").unwrap())
+                .unwrap();
+            let bar = fraction.marks.last().unwrap();
+            let bar_left = bar.points.first().unwrap().0;
+            let bar_right = bar.points.last().unwrap().0;
+            let content: Vec<_> = fraction.marks[..fraction.marks.len() - 1]
+                .iter()
+                .flat_map(|mark| mark.points.iter().map(|p| p.0))
+                .collect();
+            let content_left = content.iter().copied().fold(f32::INFINITY, f32::min);
+            let content_right = content.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            assert!(
+                content_left - bar_left >= 5.0,
+                "seed {seed}: left bar too short"
+            );
+            assert!(
+                bar_right - content_right >= 5.0,
+                "seed {seed}: right bar too short"
+            );
+            assert!(bar_right <= fraction.width, "seed {seed}: bar exceeds box");
+            widths.push(bar_right - bar_left);
+        }
+        let width_range = widths.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+            - widths.iter().copied().fold(f32::INFINITY, f32::min);
+        assert!(width_range > 3.0, "fraction bars all have the same length");
+    }
+
+    #[test]
+    fn aligned_rows_have_room_between_full_height_digits() {
+        let hand = fixture();
+        let mut layout = Layout {
+            hand: &hand,
+            seed: 0,
+            occurrences: HashMap::new(),
+            variation: false,
+            placed: 0,
+        };
+        let digit = layout.glyph("1").unwrap();
+        let rows = layout
+            .layout(&parse(r"\begin{aligned}&1\\&1\end{aligned}").unwrap())
+            .unwrap();
+        let first_y = rows.marks[0].points[0].1;
+        let second_y = rows.marks[1].points[0].1;
+        assert!((second_y - first_y - digit.above - digit.below - ALIGNED_ROW_GAP).abs() < 0.01);
     }
 
     #[test]
@@ -1993,7 +2083,7 @@ mod tests {
     }
 
     #[test]
-    fn delimiters_are_not_jittered() {
+    fn collected_parentheses_vary_without_touching_their_contents() {
         let mut hand = fixture();
         for key in ["(", ")"] {
             let glyph: Glyph = serde_json::from_value(serde_json::json!({
@@ -2007,41 +2097,80 @@ mod tests {
             .unwrap();
             hand.glyphs.insert(key.into(), glyph);
         }
-        let mut layout = varied(&hand, 0);
-        let drawn = layout.layout(&parse(r"\left(1\right)").unwrap()).unwrap();
         let recorded = &hand.glyphs.get("(").unwrap().variants[0].strokes[0];
-        let first = drawn
-            .marks
-            .iter()
-            .find(|mark| mark.points.len() == recorded.len())
-            .unwrap();
-        // Collected parentheses are stretched vertically to fit their contents,
-        // but jitter would also rotate or scale them horizontally, so the
-        // horizontal deltas must match the recording exactly and the vertical
-        // deltas must follow one uniform stretch factor.
-        let mut stretch: Option<f32> = None;
-        for (pair, recorded_pair) in first.points.windows(2).zip(recorded.windows(2)) {
-            let (dx, dy) = (pair[1].0 - pair[0].0, pair[1].1 - pair[0].1);
-            let (ex, ey) = (
-                (recorded_pair[1].x - recorded_pair[0].x) * UNIT,
-                -(recorded_pair[1].y - recorded_pair[0].y) * UNIT,
+        let mut widths = Vec::new();
+        for seed in 0..32 {
+            let drawn = varied(&hand, seed)
+                .layout(&parse(r"\left(1\right)").unwrap())
+                .unwrap();
+            let body = &drawn.marks[0];
+            let opening = &drawn.marks[1];
+            let closing = &drawn.marks[2];
+            let (max_open, min_body) = (
+                opening
+                    .points
+                    .iter()
+                    .map(|p| p.0)
+                    .fold(f32::NEG_INFINITY, f32::max),
+                body.points
+                    .iter()
+                    .map(|p| p.0)
+                    .fold(f32::INFINITY, f32::min),
+            );
+            let (max_body, min_close) = (
+                body.points
+                    .iter()
+                    .map(|p| p.0)
+                    .fold(f32::NEG_INFINITY, f32::max),
+                closing
+                    .points
+                    .iter()
+                    .map(|p| p.0)
+                    .fold(f32::INFINITY, f32::min),
             );
             assert!(
-                (dx - ex).abs() < 0.01,
-                "horizontal shape changed: {dx} vs {ex}"
+                min_body - max_open >= 2.0,
+                "seed {seed}: opening touches content"
             );
-            if ey.abs() > 0.01 {
-                let ratio = dy / ey;
-                match stretch {
-                    None => stretch = Some(ratio),
-                    Some(expected) => assert!(
-                        (ratio - expected).abs() < 0.01,
-                        "vertical stretch is not uniform: {ratio} vs {expected}"
-                    ),
+            assert!(
+                min_close - max_body >= 2.0,
+                "seed {seed}: closing touches content"
+            );
+            widths.push(
+                opening
+                    .points
+                    .iter()
+                    .map(|p| p.0)
+                    .fold(f32::NEG_INFINITY, f32::max)
+                    - opening
+                        .points
+                        .iter()
+                        .map(|p| p.0)
+                        .fold(f32::INFINITY, f32::min),
+            );
+
+            // Vertical stretching is still uniform; the new variation is
+            // horizontal only and keeps the recorded gesture recognizable.
+            let mut stretch: Option<f32> = None;
+            for (pair, original) in opening.points.windows(2).zip(recorded.windows(2)) {
+                let dy = pair[1].1 - pair[0].1;
+                let original_dy = -(original[1].y - original[0].y) * UNIT;
+                if original_dy.abs() > 0.01 {
+                    let ratio = dy / original_dy;
+                    if let Some(previous) = stretch {
+                        assert!((ratio - previous).abs() < 0.01);
+                    }
+                    stretch = Some(ratio);
                 }
             }
+            assert!(stretch.is_some());
         }
-        assert!(stretch.is_some(), "delimiter was not stretched vertically");
+        let span = widths.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+            - widths.iter().copied().fold(f32::INFINITY, f32::min);
+        assert!(
+            span > 2.0,
+            "collected parentheses barely vary: width range {span}"
+        );
     }
 
     #[test]
