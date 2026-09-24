@@ -123,6 +123,7 @@ impl Handwriting {
 const UNIT: f32 = 0.48; // 145 source-pixel capital -> 70 output pixels
 const GAP: f32 = 4.5;
 const TEXT_GAP: f32 = 6.5;
+const DIGIT_GAP: f32 = 9.0;
 // Geometry may shrink for scripts and fractions, but ink width never does.
 const INK_WIDTH: f32 = 1.7;
 #[derive(Clone)]
@@ -559,9 +560,20 @@ impl Layout<'_> {
                     let previous = i.checked_sub(1).map(|j| &nodes[j]);
                     let pad = Self::operator_padding(node, previous);
                     let group_gap = Self::delimiter_gap(previous, node);
+                    let digit_gap = match (previous, node) {
+                        (Some(Node::Glyph(a)), Node::Glyph(b))
+                            if a.len() == 1
+                                && b.len() == 1
+                                && a.as_bytes()[0].is_ascii_digit()
+                                && b.as_bytes()[0].is_ascii_digit() =>
+                        {
+                            DIGIT_GAP
+                        }
+                        _ => 0.0,
+                    };
                     out.above = out.above.max(b.above);
                     out.below = out.below.max(b.below);
-                    let x = out.width + pad + group_gap;
+                    let x = out.width + pad + group_gap + digit_gap;
                     out.width = x + b.width + pad;
                     out.add(b.translated(x, 0.0));
                 }
@@ -572,7 +584,12 @@ impl Layout<'_> {
                 let bottom = self.layout(b)?.scaled(0.55);
                 let width = top.width.max(bottom.width) + 14.0;
                 let axis = -self.math_axis();
-                let (ty, by) = (axis - 4.5 - top.below, axis + 4.5 + bottom.above);
+                // Let long descenders extend slightly through the bar, while
+                // retaining separation from the denominator below it.
+                let numerator_descender_offset = top.below.min(8.0);
+                let ty = axis - 4.5 - top.below + numerator_descender_offset;
+                let by =
+                    axis + 4.5 + bottom.above + (numerator_descender_offset - 4.5).max(0.0) * 1.5;
                 let mut out = Box2 {
                     width,
                     above: (-ty + top.above).max(0.0),
@@ -820,6 +837,7 @@ impl Layout<'_> {
     fn text(&mut self, text: &str) -> Result<Box2> {
         let mut out = Box2::empty();
         let mut word: Vec<(Box2, f32)> = Vec::new();
+        let mut previous_char = None;
         for ch in text.chars() {
             let b = if ch == ' ' {
                 Box2 {
@@ -834,6 +852,9 @@ impl Layout<'_> {
             out.above = out.above.max(b.above);
             out.below = out.below.max(b.below);
             let mut x = out.width;
+            if ch.is_ascii_digit() && previous_char.is_some_and(|c: char| c.is_ascii_digit()) {
+                x += DIGIT_GAP;
+            }
             if ch.is_ascii_alphabetic()
                 && let Some((prior, prior_x)) = word.last()
                 && let (Some((_, prior_right)), Some((current_left, _))) =
@@ -856,6 +877,7 @@ impl Layout<'_> {
                 word.clear();
             }
             out.add(b.translated(x, 0.0));
+            previous_char = Some(ch);
         }
         Ok(out)
     }
@@ -1003,6 +1025,49 @@ mod tests {
         assert!(
             (1.0..1.3).contains(&ratio),
             "fraction/full digit height: {ratio}"
+        );
+    }
+
+    #[test]
+    fn numerator_descenders_can_extend_below_the_fraction_bar() {
+        let mut hand = fixture();
+        let glyph: Glyph = serde_json::from_value(serde_json::json!({
+            "key":"g", "status":"complete",
+            "bbox":{"minX":0,"maxX":45,"minY":-55,"maxY":65},
+            "strokes":[[{"x":0,"y":65},{"x":45,"y":-55}]]
+        }))
+        .unwrap();
+        hand.glyphs.insert("g".into(), glyph);
+        let mut layout = Layout {
+            hand: &hand,
+            seed: 0,
+            occurrences: HashMap::new(),
+        };
+        let with_descender = layout.layout(&parse(r"\frac{g}{1}").unwrap()).unwrap();
+        let ordinary = layout.layout(&parse(r"\frac{1}{1}").unwrap()).unwrap();
+        let bar_y = with_descender.marks[2].points[0].1;
+        assert!(with_descender.marks[0].points[1].1 > bar_y);
+        assert!(with_descender.marks[1].points[0].1 > with_descender.marks[0].points[1].1);
+        assert!(ordinary.marks[0].points[1].1 < ordinary.marks[2].points[0].1);
+    }
+
+    #[test]
+    fn consecutive_digits_have_extra_spacing_without_changing_letters() {
+        let hand = fixture();
+        let mut layout = Layout {
+            hand: &hand,
+            seed: 0,
+            occurrences: HashMap::new(),
+        };
+        let digit_width = layout.glyph("1").unwrap().width;
+        let letter_width = layout.glyph("x").unwrap().width;
+        assert!(
+            (layout.layout(&parse("11").unwrap()).unwrap().width - 2.0 * digit_width - DIGIT_GAP)
+                .abs()
+                < 0.01
+        );
+        assert!(
+            (layout.layout(&parse("xx").unwrap()).unwrap().width - 2.0 * letter_width).abs() < 0.01
         );
     }
 

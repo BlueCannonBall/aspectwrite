@@ -145,6 +145,7 @@ Only these explicit spacing commands are accepted:
 * `\,` — thin space;
 * `\:` — medium space;
 * `\;` — thick space;
+* `\enspace` — half-em space;
 * `\quad` and `\qquad` — large and extra-large spaces.
 
 Ordinary source whitespace is ignored in math mode. In particular, unit

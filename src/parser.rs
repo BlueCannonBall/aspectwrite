@@ -269,6 +269,7 @@ impl<'a> Parser<'a> {
             }
             "hat" | "widehat" | "bar" | "overline" | "tilde" | "widetilde" | "vec" | "dot"
             | "ddot" | "underline" => Ok(Node::Accent(name.into(), Box::new(self.group()?))),
+            "enspace" => Ok(Node::Space(16.0)),
             "quad" => Ok(Node::Space(32.0)),
             "qquad" => Ok(Node::Space(64.0)),
             "cdots" | "ldots" => Ok(Node::Glyph(format!("\\{name}"))),
