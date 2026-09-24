@@ -33,5 +33,6 @@ cargo test
 cargo clippy --all-targets
 python tests/mcp_client.py --local
 node --experimental-strip-types tests/pi-extension.mjs
+node tests/collector-input.cjs
 node tests/collector.cjs path/to/old/v1-export.json
 ```
