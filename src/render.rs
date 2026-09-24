@@ -123,7 +123,7 @@ impl Handwriting {
 const UNIT: f32 = 0.48; // 145 source-pixel capital -> 70 output pixels
 const GAP: f32 = 4.5;
 const TEXT_GAP: f32 = 6.5;
-const DIGIT_GAP: f32 = 3.0;
+const DIGIT_GAP: f32 = 9.0;
 // Geometry may shrink for scripts and fractions, but ink width never does.
 const INK_WIDTH: f32 = 1.7;
 #[derive(Clone)]
