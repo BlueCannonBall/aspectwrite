@@ -146,7 +146,7 @@ const UNIT: f32 = 0.48; // 145 source-pixel capital -> 70 output pixels
 const GAP: f32 = 4.5;
 const TEXT_GAP: f32 = 6.5;
 const DIGIT_GAP: f32 = 9.0;
-const DECIMAL_POINT_GAP: f32 = 12.0;
+const DECIMAL_POINT_GAP: f32 = 8.0;
 const ALIGNED_ROW_GAP: f32 = 36.0;
 const FRACTION_EXTRA_WIDTH: f32 = 30.0;
 const FRACTION_EXTRA_WIDTH_VARIATION: f32 = 8.0;
@@ -983,19 +983,25 @@ impl Layout<'_> {
                 Ok(out)
             }
             Node::Script { base, sub, sup } => {
+                let integral = matches!(base.as_ref(), Node::Glyph(key)
+                    if matches!(key.as_str(), "\\int" | "\\oint" | "\\iint" | "\\iiint"));
                 let base = self.layout(base)?;
                 let sub = sub
                     .as_deref()
                     .map(|n| {
-                        self.layout(n)
-                            .map(|b| b.scaled(0.50).scaled_vertically(0.82))
+                        self.layout(n).map(|b| {
+                            b.scaled(if integral { 0.40 } else { 0.50 })
+                                .scaled_vertically(0.82)
+                        })
                     })
                     .transpose()?;
                 let sup = sup
                     .as_deref()
                     .map(|n| {
-                        self.layout(n)
-                            .map(|b| b.scaled(0.55).scaled_vertically(0.85))
+                        self.layout(n).map(|b| {
+                            b.scaled(if integral { 0.44 } else { 0.55 })
+                                .scaled_vertically(0.85)
+                        })
                     })
                     .transpose()?;
                 if base.large {
@@ -1910,6 +1916,15 @@ mod tests {
         let limits = layout.layout(&parse(r"\int_{T_1}^{T_1}").unwrap()).unwrap();
         assert!(limits.above > integral.above + 10.0);
         assert!(limits.below > integral.below + 10.0);
+        let simple_limits = layout.layout(&parse(r"\int_{T}^{T}").unwrap()).unwrap();
+        let full_t = layout.glyph("T").unwrap().marks[0].points[1].0;
+        for bound in &simple_limits.marks[1..] {
+            let bound_width = bound.points[1].0 - bound.points[0].0;
+            assert!(
+                bound_width < full_t * 0.45,
+                "integral bound too large: {bound_width}"
+            );
+        }
         let one_word = layout.text("xx").unwrap();
         let two_words = layout.text("x x").unwrap();
         assert!(two_words.width > one_word.width + 10.0);
