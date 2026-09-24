@@ -147,6 +147,10 @@ const GAP: f32 = 4.5;
 const TEXT_GAP: f32 = 6.5;
 const DIGIT_GAP: f32 = 9.0;
 const SUBSCRIPT_INK_GAP: f32 = 7.0;
+const ENTRY_STROKE_START_WEIGHT: f32 = 0.47;
+const ENTRY_STROKE_JOIN_LENGTH: f32 = 1.0;
+const L_ENTRY_STROKE_TAPER_LENGTH: f32 = 9.0;
+const ONE_ENTRY_STROKE_TAPER_LENGTH: f32 = 25.0;
 const DECIMAL_POINT_GAP: f32 = 8.0;
 const ALIGNED_ROW_GAP: f32 = 36.0;
 const FRACTION_EXTRA_WIDTH: f32 = 30.0;
@@ -235,6 +239,9 @@ struct Mark {
     points: Vec<(f32, f32)>,
     pressures: Option<Vec<f32>>,
     parenthesis: bool,
+    /// Number of generated entry points before the captured downstroke.
+    entry_tail_points: usize,
+    entry_taper_length: f32,
 }
 #[derive(Clone)]
 struct Box2 {
@@ -301,6 +308,8 @@ impl Box2 {
             points,
             pressures: None,
             parenthesis: false,
+            entry_tail_points: 0,
+            entry_taper_length: 0.0,
         });
     }
     fn parenthesis(&mut self, points: Vec<(f32, f32)>) {
@@ -312,6 +321,8 @@ impl Box2 {
             points,
             pressures: Some(pressures),
             parenthesis: true,
+            entry_tail_points: 0,
+            entry_taper_length: 0.0,
         });
     }
 }
@@ -515,24 +526,198 @@ const MAX_BAR_WOBBLE: f32 = MAX_LINE_WAVE * 1.5 + MAX_LINE_TILT / 2.0;
 
 /// A hand-drawn straight line: a slight wave and tilt that fade to nothing at
 /// the endpoints, so the line still spans exactly the same two points.
-fn hand_drawn_line(seed: u64, placed: usize, from: (f32, f32), to: (f32, f32)) -> Vec<(f32, f32)> {
-    let bits = instance_bits(seed, "\\fracbar", placed);
+fn hand_drawn_line(
+    seed: u64,
+    placed: usize,
+    key: &str,
+    from: (f32, f32),
+    to: (f32, f32),
+) -> Vec<(f32, f32)> {
+    let bits = instance_bits(seed, key, placed);
+    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+    let length = dx.hypot(dy).max(1.0);
+    let normal = (-dy / length, dx / length);
     let phase_a = unit_interval(bits) * std::f32::consts::TAU;
     let phase_b = unit_interval(mix64(bits.rotate_left(23))) * std::f32::consts::TAU;
     let tilt = MAX_LINE_TILT * unit_signed(mix64(bits.rotate_left(37)));
+    let root_segment = key.starts_with("\\sqrt");
+    let root_wobble_scale = (length / 65.0).clamp(0.15, 1.0);
     (0..=HAND_DRAWN_LINE_SEGMENTS)
         .map(|index| {
             let t = index as f32 / HAND_DRAWN_LINE_SEGMENTS as f32;
             let envelope = (std::f32::consts::PI * t).sin();
-            let wave = envelope
-                * (MAX_LINE_WAVE * (t * 5.3 + phase_a).sin()
-                    + 0.5 * MAX_LINE_WAVE * (t * 9.1 + phase_b).sin());
+            let wave = MAX_LINE_WAVE * (t * 5.3 + phase_a).sin()
+                + 0.5 * MAX_LINE_WAVE * (t * 9.1 + phase_b).sin();
+            // Short radical segments should not have the same-sized wobble as
+            // an overline. Anchor their joins so they meet without small kinks.
+            let deviation = if root_segment {
+                envelope * (wave + (t - 0.5) * tilt) * root_wobble_scale
+            } else {
+                envelope * wave + (t - 0.5) * tilt
+            };
             (
-                from.0 + (to.0 - from.0) * t,
-                from.1 + (to.1 - from.1) * t + wave + (t - 0.5) * tilt,
+                from.0 + dx * t + normal.0 * deviation,
+                from.1 + dy * t + normal.1 * deviation,
             )
         })
         .collect()
+}
+
+/// Largest distance a stroke may start below its own top and still count as a
+/// free stem end whose lead-in can be replaced.
+const ENTRY_MAX_START_BELOW_TOP: f32 = 10.0;
+/// Largest horizontal travel of the replaced lead-in: a longer sweep along the
+/// writing is a real entry stroke and must be left intact.
+const ENTRY_MAX_HORIZONTAL_REACH: f32 = 4.0;
+
+/// The point where a synthetic entry may join a captured stroke: past a short
+/// lead-in, where the stroke has settled into its downstroke. `None` when the
+/// stroke is not a free stem end.
+fn entry_tail_join(mark: &Mark, glyph_top: f32, glyph_height: f32) -> Option<usize> {
+    let &first = mark.points.first()?;
+    let stroke_top = mark
+        .points
+        .iter()
+        .map(|p| p.1)
+        .fold(f32::INFINITY, f32::min);
+    let stroke_bottom = mark
+        .points
+        .iter()
+        .map(|p| p.1)
+        .fold(f32::NEG_INFINITY, f32::max);
+    if glyph_height < 35.0 || stroke_bottom - stroke_top < glyph_height * 0.6 {
+        return None;
+    }
+    // A stroke that starts far below the top is not a stem end; leave it alone.
+    if first.1 - glyph_top > ENTRY_MAX_START_BELOW_TOP {
+        return None;
+    }
+    let first_down_index = mark.points.iter().position(|p| p.1 - first.1 >= 3.0)?;
+    // A tiny upward curl at the start is replaced; join just below its peak,
+    // where the captured line has settled into its downstroke.
+    let (peak_index, _) = mark.points[..=first_down_index].iter().enumerate().fold(
+        (0, f32::INFINITY),
+        |(best, top), (index, point)| {
+            if point.1 <= top + 0.15 {
+                (index, point.1)
+            } else {
+                (best, top)
+            }
+        },
+    );
+    let join_index = if peak_index == 0 {
+        0
+    } else {
+        mark.points[peak_index..]
+            .iter()
+            .position(|p| p.1 - mark.points[peak_index].1 >= 2.0)
+            .map_or(peak_index, |offset| peak_index + offset)
+    };
+    let start = mark.points[join_index];
+    // A prefix that sweeps along the writing is a real entry stroke, not a stub.
+    if (start.0 - first.0).abs() > ENTRY_MAX_HORIZONTAL_REACH {
+        return None;
+    }
+    // The stroke must continue downward after the join.
+    mark.points[join_index + 1..]
+        .iter()
+        .find(|p| p.1 - start.1 >= 3.0)?;
+    Some(join_index)
+}
+
+/// A brief entry stroke for a free stem end. Replaces a short isolated lead-in
+/// when the captured stroke has one.
+fn add_entry_tail(
+    mark: &mut Mark,
+    bits: u64,
+    glyph_top: f32,
+    glyph_height: f32,
+    digit_one: bool,
+) -> bool {
+    let Some(join_index) = entry_tail_join(mark, glyph_top, glyph_height) else {
+        return false;
+    };
+    let start = mark.points[join_index];
+    let downstroke = mark
+        .points
+        .get(join_index + 1..)
+        .and_then(|points| points.iter().find(|p| p.1 - start.1 >= 3.0))
+        .copied()
+        .unwrap_or(start);
+    let (dx, dy) = (downstroke.0 - start.0, downstroke.1 - start.1);
+    let distance = dx.hypot(dy);
+    let length = if digit_one { 2.8 } else { 4.2 }
+        + if digit_one { 1.1 } else { 1.3 } * unit_interval(mix64(bits.rotate_left(29)));
+    let tip_drop = if digit_one { -0.2 } else { -1.0 }
+        + if digit_one { 3.2 } else { 4.0 } * unit_interval(mix64(bits.rotate_left(13)));
+    let tip = (start.0 - length, start.1 + tip_drop);
+    let control_a = (
+        tip.0 + length * 0.45,
+        tip.1 - 0.8 - tip_drop.max(0.0) * 0.65,
+    );
+    // Follow the direction of the captured downstroke at the join instead of
+    // adding a short corner that looks pasted onto the letter.
+    let control_b = (start.0 - 2.0 * dx / distance, start.1 - 2.0 * dy / distance);
+    let entry: Vec<_> = (0..4)
+        .map(|step| {
+            let t = step as f32 / 4.0;
+            let u = 1.0 - t;
+            (
+                u * u * u * tip.0
+                    + 3.0 * u * u * t * control_a.0
+                    + 3.0 * u * t * t * control_b.0
+                    + t * t * t * start.0,
+                u * u * u * tip.1
+                    + 3.0 * u * u * t * control_a.1
+                    + 3.0 * u * t * t * control_b.1
+                    + t * t * t * start.1,
+            )
+        })
+        .collect();
+    if mark.pressures.is_none() {
+        mark.pressures = Some(vec![0.5; mark.points.len()]);
+    }
+    if let Some(pressures) = &mut mark.pressures {
+        let start_pressure = pressures[join_index];
+        pressures.splice(0..join_index, [start_pressure; 4]);
+    }
+    mark.points.splice(0..join_index, entry);
+    mark.entry_tail_points = 4;
+    mark.entry_taper_length = if digit_one {
+        ONE_ENTRY_STROKE_TAPER_LENGTH
+    } else {
+        L_ENTRY_STROKE_TAPER_LENGTH
+    };
+    true
+}
+
+/// Bias an adjacent entry toward the previous pen lift, without drawing a
+/// line all the way to it. Preserve the tangent at the recorded downstroke.
+fn adjust_entry_for_previous_stroke(box2: &mut Box2, previous_end: (f32, f32), x: f32) {
+    let Some(mark) = box2
+        .marks
+        .iter_mut()
+        .find(|mark| mark.entry_tail_points > 0)
+    else {
+        return;
+    };
+    let count = mark.entry_tail_points;
+    let join = mark.points[count];
+    let horizontal = x + join.0 - previous_end.0;
+    let vertical = previous_end.1 - join.1;
+    if !(0.0..=32.0).contains(&horizontal) || !(10.0..=100.0).contains(&vertical) {
+        return;
+    }
+    let desired_drop = (vertical * 0.235).clamp(4.0, 16.0);
+    let adjustment = desired_drop - (mark.points[0].1 - join.1);
+    for (i, point) in mark.points[..count].iter_mut().enumerate() {
+        let remaining = 1.0 - i as f32 / count as f32;
+        point.1 += adjustment * remaining * remaining;
+    }
+    if let Some((top, bottom)) = ink_extent(box2, |point| point.1) {
+        box2.above = (-top).max(0.0);
+        box2.below = bottom.max(0.0);
+    }
 }
 
 pub fn png(node: &Node, handwriting: &Handwriting) -> Result<Vec<u8>> {
@@ -550,8 +735,8 @@ pub fn png_with_seed_scaled(
     seed: u64,
     scale: u32,
 ) -> Result<Vec<u8>> {
-    if !(1..=4).contains(&scale) {
-        return Err(RenderError("output scale must be between 1 and 4".into()));
+    if !(1..=16).contains(&scale) {
+        return Err(RenderError("output scale must be between 1 and 16".into()));
     }
     let scale = scale as f32;
     let mut engine = Layout {
@@ -579,6 +764,32 @@ pub fn png_with_seed_scaled(
             continue;
         }
         vary_parenthesis(&mut mark);
+        if mark.entry_tail_points > 0 {
+            // A captured downstroke may begin with one long sampled segment.
+            // Split it near the join so the light entry does not stay thin for
+            // the whole segment and then jump to the next segment's width.
+            let mut distance = 0.0;
+            for index in mark.entry_tail_points..mark.points.len() - 1 {
+                let from = mark.points[index];
+                let to = mark.points[index + 1];
+                let length = (to.0 - from.0).hypot(to.1 - from.1);
+                if distance + length > ENTRY_STROKE_JOIN_LENGTH {
+                    let t = (ENTRY_STROKE_JOIN_LENGTH - distance) / length;
+                    if (0.01..0.99).contains(&t) {
+                        mark.points.insert(
+                            index + 1,
+                            (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t),
+                        );
+                        if let Some(pressures) = &mut mark.pressures {
+                            let from = pressures[index];
+                            pressures.insert(index + 1, from + (pressures[index + 1] - from) * t);
+                        }
+                    }
+                    break;
+                }
+                distance += length;
+            }
+        }
         let mut builder = PathBuilder::new();
         if mark.points.len() == 1 {
             let (x, y) = mark.points[0];
@@ -607,19 +818,82 @@ pub fn png_with_seed_scaled(
             let mut paint = Paint::default();
             paint.set_color(Color::BLACK);
             paint.anti_alias = true;
-            for (segment, values) in mark.points.windows(2).zip(pressures.windows(2)) {
-                let ((x1, y1), (x2, y2)) = (segment[0], segment[1]);
-                let mut builder = PathBuilder::new();
-                builder.move_to((margin + x1) * scale, (margin + layout.above + y1) * scale);
-                builder.line_to((margin + x2) * scale, (margin + layout.above + y2) * scale);
-                if let Some(path) = builder.finish() {
+            let mut captured_distance = 0.0;
+            let mut rendered_entry_segments = 0;
+            if mark.entry_tail_points > 0 {
+                let mut last = mark.entry_tail_points;
+                while last + 1 < mark.points.len() && captured_distance < 0.75 {
+                    let from = mark.points[last];
+                    let to = mark.points[last + 1];
+                    captured_distance += (to.0 - from.0).hypot(to.1 - from.1);
+                    last += 1;
+                }
+                let mut entry = PathBuilder::new();
+                let (x, y) = mark.points[0];
+                entry.move_to((margin + x) * scale, (margin + layout.above + y) * scale);
+                for &(x, y) in &mark.points[1..=last] {
+                    entry.line_to((margin + x) * scale, (margin + layout.above + y) * scale);
+                }
+                if let Some(path) = entry.finish() {
                     let stroke = Stroke {
-                        width: ink.width((values[0] + values[1]) * 0.5) * scale,
+                        width: ink.width(pressures[mark.entry_tail_points])
+                            * ENTRY_STROKE_START_WEIGHT
+                            * scale,
                         line_cap: tiny_skia::LineCap::Round,
+                        line_join: tiny_skia::LineJoin::Round,
                         ..Stroke::default()
                     };
                     pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
                 }
+                rendered_entry_segments = last;
+            }
+            for (i, (segment, values)) in
+                mark.points.windows(2).zip(pressures.windows(2)).enumerate()
+            {
+                if i < rendered_entry_segments {
+                    continue;
+                }
+                let ((x1, y1), (x2, y2)) = (segment[0], segment[1]);
+                let segment_length = (x2 - x1).hypot(y2 - y1);
+                let sections =
+                    if mark.entry_tail_points > 0 && captured_distance < mark.entry_taper_length {
+                        (segment_length / 1.5).ceil().max(1.0) as usize
+                    } else {
+                        1
+                    };
+                for section in 0..sections {
+                    let from_t = section as f32 / sections as f32;
+                    let to_t = (section + 1) as f32 / sections as f32;
+                    let midpoint = captured_distance + segment_length * (from_t + to_t) * 0.5;
+                    let mut builder = PathBuilder::new();
+                    builder.move_to(
+                        (margin + x1 + (x2 - x1) * from_t) * scale,
+                        (margin + layout.above + y1 + (y2 - y1) * from_t) * scale,
+                    );
+                    builder.line_to(
+                        (margin + x1 + (x2 - x1) * to_t) * scale,
+                        (margin + layout.above + y1 + (y2 - y1) * to_t) * scale,
+                    );
+                    if let Some(path) = builder.finish() {
+                        let pressure = values[0] + (values[1] - values[0]) * (from_t + to_t) * 0.5;
+                        let width = if mark.entry_tail_points == 0 {
+                            ink.width(pressure)
+                        } else {
+                            let progress = (midpoint / mark.entry_taper_length).clamp(0.0, 1.0);
+                            let gradual_progress = progress * progress * (3.0 - 2.0 * progress);
+                            let entry_width = ink.width(pressures[mark.entry_tail_points])
+                                * ENTRY_STROKE_START_WEIGHT;
+                            entry_width + (ink.width(pressure) - entry_width) * gradual_progress
+                        };
+                        let stroke = Stroke {
+                            width: width * scale,
+                            line_cap: tiny_skia::LineCap::Round,
+                            ..Stroke::default()
+                        };
+                        pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+                    }
+                }
+                captured_distance += segment_length;
             }
         } else {
             let (x, y) = mark.points[0];
@@ -867,11 +1141,57 @@ impl Layout<'_> {
                 points,
                 pressures,
                 parenthesis: false,
+                entry_tail_points: 0,
+                entry_taper_length: 0.0,
             });
+        }
+        let mut tail_added = false;
+        // Letters whose top is a free stem end. P and F are excluded because a
+        // cut-back backbone would detach the bowl and crossbars.
+        let eligible = matches!(
+            key,
+            "H" | "K"
+                | "L"
+                | "T"
+                | "U"
+                | "V"
+                | "W"
+                | "X"
+                | "Y"
+                | "Z"
+                | "b"
+                | "h"
+                | "k"
+                | "l"
+                | "m"
+                | "n"
+                | "t"
+                | "1"
+        );
+        if self.variation && eligible {
+            let tail_key = format!("{key}-tail");
+            let bits = instance_bits(self.seed, &tail_key, occurrence);
+            let digit_one = key == "1";
+            let chance = 0.35;
+            if unit_interval(mix64(bits.rotate_left(17))) < chance
+                && let Some((top, bottom)) = ink_extent(&out, |point| point.1)
+            {
+                for mark in &mut out.marks {
+                    if add_entry_tail(mark, bits, top, bottom - top, digit_one) {
+                        tail_added = true;
+                        break;
+                    }
+                }
+            }
         }
         // Measure the drawn ink so jittered glyphs keep correct spacing and are
         // never clipped by the image bounds.
         if let Some((min_x, max_x)) = ink_extent(&out, |point| point.0) {
+            if tail_added && min_x < 0.0 {
+                for point in out.marks.iter_mut().flat_map(|mark| &mut mark.points) {
+                    point.0 -= min_x;
+                }
+            }
             out.width = (max_x - min_x).max(3.0) + GAP;
         }
         if let Some((min_y, max_y)) = ink_extent(&out, |point| point.1) {
@@ -891,7 +1211,7 @@ impl Layout<'_> {
             Node::Row(nodes) => {
                 let mut out = Box2::empty();
                 for (i, node) in nodes.iter().enumerate() {
-                    let b = self.layout(node)?;
+                    let mut b = self.layout(node)?;
                     let previous = i.checked_sub(1).map(|j| &nodes[j]);
                     let pad = Self::operator_padding(node, previous);
                     let group_gap = Self::delimiter_gap(previous, node);
@@ -913,10 +1233,18 @@ impl Layout<'_> {
                     } else {
                         0.0
                     };
+                    let x = out.width + pad + group_gap + digit_gap + decimal_gap;
+                    if matches!(node, Node::Glyph(key) if matches!(key.as_str(), "L" | "l" | "1"))
+                        && matches!(previous, Some(Node::Glyph(key))
+                            if (key.len() == 1 && key.as_bytes()[0].is_ascii_alphanumeric())
+                                || key == "\\mu")
+                        && let Some(previous_end) = out.marks.last().and_then(|m| m.points.last())
+                    {
+                        adjust_entry_for_previous_stroke(&mut b, *previous_end, x);
+                    }
                     out.above = out.above.max(b.above);
                     out.below = out.below.max(b.below);
                     out.script_drop = out.script_drop.max(b.script_drop);
-                    let x = out.width + pad + group_gap + digit_gap + decimal_gap;
                     out.width = x + b.width + pad;
                     out.add(b.translated(x, 0.0));
                 }
@@ -965,6 +1293,7 @@ impl Layout<'_> {
                     hand_drawn_line(
                         self.seed,
                         self.next_placement(),
+                        "\\fracbar",
                         (2.0, axis),
                         (width - 2.0, axis),
                     )
@@ -988,13 +1317,72 @@ impl Layout<'_> {
                 };
                 out.script_drop = out.script_drop.max(body_script_drop);
                 out.add(body.translated(26.0, 0.0));
-                out.line(vec![
+                let placed = self.next_placement();
+                let bits = instance_bits(self.seed, "\\sqrt-bend", placed);
+                let (approach_x, bend_x, bend_y) = if self.variation {
+                    (
+                        9.0 + 1.8 * unit_signed(bits),
+                        15.0 + 4.0 * unit_signed(mix64(bits.rotate_left(17))),
+                        10.0 + 1.6 * unit_signed(mix64(bits.rotate_left(31))),
+                    )
+                } else {
+                    (9.0, 15.0, 10.0)
+                };
+                let corners = [
                     (1.0, -cap * 0.45),
-                    (9.0, -cap * 0.25),
-                    (15.0, 10.0),
+                    (approach_x, -cap * 0.25),
+                    (bend_x, bend_y),
                     (27.0, -cap),
                     (out.width - 3.0, -cap),
-                ]);
+                ];
+                let stroke = if self.variation {
+                    let mut stroke = Vec::new();
+                    let rounded =
+                        unit_interval(instance_bits(self.seed, "\\sqrt-round", placed)) < 0.5;
+                    let radius = 10.0 + 4.0 * unit_interval(mix64(bits.rotate_left(43)));
+                    let toward = |from: (f32, f32), to: (f32, f32)| {
+                        let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+                        let fraction = radius / dx.hypot(dy);
+                        (from.0 + dx * fraction, from.1 + dy * fraction)
+                    };
+                    let before = toward(corners[2], corners[1]);
+                    let after = toward(corners[2], corners[3]);
+                    let segments = [
+                        (corners[0], corners[1], "\\sqrt-entry"),
+                        (
+                            corners[1],
+                            if rounded { before } else { corners[2] },
+                            "\\sqrt-down",
+                        ),
+                        (
+                            if rounded { after } else { corners[2] },
+                            corners[3],
+                            "\\sqrt-up",
+                        ),
+                        (corners[3], corners[4], "\\sqrtbar"),
+                    ];
+                    for (i, &(from, to, key)) in segments.iter().enumerate() {
+                        if i == 2 && rounded {
+                            for step in 1..=6 {
+                                let t = step as f32 / 6.0;
+                                let u = 1.0 - t;
+                                stroke.push((
+                                    u * u * before.0 + 2.0 * u * t * corners[2].0 + t * t * after.0,
+                                    u * u * before.1 + 2.0 * u * t * corners[2].1 + t * t * after.1,
+                                ));
+                            }
+                        }
+                        stroke.extend(
+                            hand_drawn_line(self.seed, placed, key, from, to)
+                                .into_iter()
+                                .skip(usize::from(i > 0)),
+                        );
+                    }
+                    stroke
+                } else {
+                    corners.to_vec()
+                };
+                out.line(stroke);
                 if let Some(index) = index {
                     let small = self.layout(index)?.scaled(0.48);
                     out.above = out.above.max(cap + small.above + 4.0);
@@ -1499,6 +1887,217 @@ mod tests {
         assert!(
             largest <= MAX_LINE_WAVE * 1.5,
             "the bar waves too much: {largest}"
+        );
+    }
+
+    #[test]
+    fn captured_l_entry_tails_are_occasional_tapered_and_repeatable() {
+        let mut hand = fixture();
+        hand.glyphs.insert(
+            "L".into(),
+            serde_json::from_value(serde_json::json!({
+                "key":"L", "status":"complete",
+                "bbox":{"minX":0,"maxX":45,"minY":0,"maxY":120},
+                "strokes":[[
+                    {"x":5,"y":120,"p":0.6}, {"x":4,"y":90,"p":0.7},
+                    {"x":8,"y":10,"p":0.8}, {"x":45,"y":0,"p":0.5}
+                ]]
+            }))
+            .unwrap(),
+        );
+        let expression = parse("LLLLLLLL").unwrap();
+        let plain = Layout {
+            hand: &hand,
+            seed: 7,
+            occurrences: HashMap::new(),
+            variation: false,
+            placed: 0,
+        }
+        .layout(&expression)
+        .unwrap();
+        assert!(plain.marks.iter().all(|mark| mark.points.len() == 4));
+        let drawn = varied(&hand, 7).layout(&expression).unwrap();
+        let repeated = varied(&hand, 7).layout(&expression).unwrap();
+        let mut tail_count = 0;
+        let mut tip_drops = Vec::new();
+        for (mark, again) in drawn.marks.iter().zip(&repeated.marks) {
+            assert_eq!(mark.points, again.points);
+            assert_eq!(mark.pressures, again.pressures);
+            if mark.points.len() == 8 {
+                tail_count += 1;
+                let pressures = mark.pressures.as_ref().unwrap();
+                assert!(
+                    pressures[..5]
+                        .windows(2)
+                        .all(|pair| (pair[0] - pair[1]).abs() < 0.001)
+                );
+                assert!(mark.points[0].0 < mark.points[4].0);
+                assert!((4.2..5.6).contains(&(mark.points[4].0 - mark.points[0].0)));
+                assert!(mark.points[3].1 < mark.points[4].1);
+                assert_eq!(mark.entry_tail_points, 4);
+                tip_drops.push(mark.points[0].1 - mark.points[4].1);
+            } else {
+                assert_eq!(mark.points.len(), 4);
+            }
+        }
+        assert!((1..drawn.marks.len()).contains(&tail_count));
+        assert!(tip_drops.iter().any(|&drop| drop < -0.1));
+        assert!(tip_drops.iter().any(|&drop| drop > 1.5));
+        // A stroke that starts well below its top is not a free stem end.
+        let mut low_start = Mark {
+            points: vec![(4.0, 12.0), (3.0, 8.0), (4.0, 20.0), (30.0, 60.0)],
+            pressures: None,
+            parenthesis: false,
+            entry_tail_points: 0,
+            entry_taper_length: 0.0,
+        };
+        assert!(!add_entry_tail(&mut low_start, 0, 0.0, 60.0, false));
+        assert_eq!(low_start.points.len(), 4);
+        let mut curled_start = Mark {
+            points: vec![
+                (0.0, 0.0),
+                (-0.3, -1.0),
+                (-0.7, -1.0),
+                (-1.0, -0.3),
+                (-1.0, 2.6),
+                (-1.3, 8.8),
+                (-2.0, 28.0),
+                (30.0, 60.0),
+            ],
+            pressures: None,
+            parenthesis: false,
+            entry_tail_points: 0,
+            entry_taper_length: 0.0,
+        };
+        assert!(add_entry_tail(&mut curled_start, 0, -1.0, 61.0, false));
+        assert!((curled_start.points[4].1 - 2.6).abs() < 0.01);
+        assert!(curled_start.points[5].1 > curled_start.points[4].1);
+        assert_eq!(
+            curled_start.pressures.unwrap().len(),
+            curled_start.points.len()
+        );
+        // A profile whose letter already begins with a long written lead-in must
+        // keep it: adding or replacing part of it would double the entry.
+        let mut long_lead_in = Mark {
+            points: vec![
+                (0.0, -1.0),
+                (2.0, -1.5),
+                (5.0, -1.0),
+                (8.0, 0.0),
+                (10.0, 6.0),
+                (10.0, 60.0),
+            ],
+            pressures: None,
+            parenthesis: false,
+            entry_tail_points: 0,
+            entry_taper_length: 0.0,
+        };
+        let original = long_lead_in.points.clone();
+        assert!(!add_entry_tail(&mut long_lead_in, 0, -1.5, 61.0, false));
+        assert_eq!(long_lead_in.points, original);
+    }
+
+    #[test]
+    fn one_entry_tails_are_occasional_and_keep_neighboring_digits_apart() {
+        let hand = fixture();
+        let expression = parse("111111").unwrap();
+        let drawn = varied(&hand, 7).layout(&expression).unwrap();
+        let repeated = varied(&hand, 7).layout(&expression).unwrap();
+        let count = drawn
+            .marks
+            .iter()
+            .filter(|mark| mark.entry_tail_points > 0)
+            .count();
+        assert!((1..drawn.marks.len()).contains(&count));
+        for (mark, again) in drawn.marks.iter().zip(&repeated.marks) {
+            assert_eq!(mark.points, again.points);
+        }
+        for pair in drawn.marks.windows(2) {
+            let right = pair[0]
+                .points
+                .iter()
+                .map(|p| p.0)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let left = pair[1]
+                .points
+                .iter()
+                .map(|p| p.0)
+                .fold(f32::INFINITY, f32::min);
+            assert!(left - right > 3.0);
+        }
+    }
+
+    #[test]
+    fn adjacent_entry_points_downward_without_extending_to_previous_stroke() {
+        let mut box2 = Box2 {
+            width: 20.0,
+            above: 60.0,
+            below: 0.0,
+            script_drop: 0.0,
+            marks: vec![Mark {
+                points: vec![
+                    (-5.0, -59.0),
+                    (-4.0, -61.0),
+                    (-2.0, -62.0),
+                    (-1.0, -61.0),
+                    (0.0, -60.0),
+                    (0.0, -57.0),
+                    (0.0, 0.0),
+                ],
+                pressures: None,
+                parenthesis: false,
+                entry_tail_points: 4,
+                entry_taper_length: ONE_ENTRY_STROKE_TAPER_LENGTH,
+            }],
+            large: false,
+        };
+        let join = box2.marks[0].points[4];
+        adjust_entry_for_previous_stroke(&mut box2, (0.0, 0.0), 10.0);
+        let tip_drop = box2.marks[0].points[0].1 - join.1;
+        assert!((10.0..20.0).contains(&tip_drop));
+        assert_eq!(box2.marks[0].points[4], join);
+        assert!(box2.marks[0].points[1].1 + 61.0 < box2.marks[0].points[0].1 + 59.0);
+    }
+
+    #[test]
+    fn root_bends_and_overlines_vary_without_reaching_the_body() {
+        let hand = fixture();
+        let expression = parse(r"\sqrt{x}").unwrap();
+        let mut bends = Vec::new();
+        let mut rounded_count = 0;
+        for seed in 0..24 {
+            let drawn = varied(&hand, seed).layout(&expression).unwrap();
+            let repeated = varied(&hand, seed).layout(&expression).unwrap();
+            assert_eq!(drawn.marks[1].points, repeated.marks[1].points);
+            let root = &drawn.marks[1].points;
+            assert!(root.len() > 5);
+            rounded_count += usize::from(root.len() > 33);
+            bends.push(root[16].0);
+            let entry_deviation = root[..=HAND_DRAWN_LINE_SEGMENTS]
+                .iter()
+                .map(|&p| {
+                    point_segment_distance_squared(p, root[0], root[HAND_DRAWN_LINE_SEGMENTS])
+                        .sqrt()
+                })
+                .fold(0.0, f32::max);
+            assert!(entry_deviation < 0.8, "seed {seed}: root entry is jagged");
+            let body_top = drawn.marks[0]
+                .points
+                .iter()
+                .map(|p| p.1)
+                .fold(f32::INFINITY, f32::min);
+            let overline_bottom = root[root.len() - HAND_DRAWN_LINE_SEGMENTS..]
+                .iter()
+                .map(|p| p.1)
+                .fold(f32::NEG_INFINITY, f32::max);
+            assert!(body_top - overline_bottom > 4.0);
+        }
+        let range = bends.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+            - bends.iter().copied().fold(f32::INFINITY, f32::min);
+        assert!(range > 2.0, "root bends hardly vary: {range}");
+        assert!(
+            (1..24).contains(&rounded_count),
+            "root corners are always the same shape"
         );
     }
 

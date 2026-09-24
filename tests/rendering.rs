@@ -28,6 +28,14 @@ fn render_small_stroke_fixture_and_report_missing_glyph() {
     assert!((large_image.height() as i32 - 3 * image.height() as i32).abs() <= 2);
     assert!(large_image.pixels().iter().any(|px| px.red() < 100));
     assert!(render::png_with_seed_scaled(&parser::parse("x").unwrap(), &hand, 0, 0).is_err());
+    let x = parser::parse("x").unwrap();
+    assert!(
+        tiny_skia::Pixmap::decode_png(&render::png_with_seed_scaled(&x, &hand, 0, 16).unwrap())
+            .unwrap()
+            .width()
+            > 900
+    );
+    assert!(render::png_with_seed_scaled(&x, &hand, 0, 17).is_err());
     let error = render::png(&parser::parse(r"x\mathbb{R}").unwrap(), &hand).unwrap_err();
     assert!(error.to_string().contains(r"\mathbb{R}"));
     std::fs::remove_file(path).unwrap();

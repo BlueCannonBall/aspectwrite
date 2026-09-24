@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     if args.len() < 5 || args[1] != "render" {
         eprintln!(
-            "Usage: aspectwrite render <strokes.json> <output.png> '<LaTeX>' [--seed <u64>] [--scale <1-4>]\n       aspectwrite mcp [strokes.json]  (defaults to .local/aspectwrite-strokes.json)"
+            "Usage: aspectwrite render <strokes.json> <output.png> '<LaTeX>' [--seed <u64>] [--scale <1-16>]\n       aspectwrite mcp [strokes.json]  (defaults to .local/aspectwrite-strokes.json)"
         );
         std::process::exit(2);
     }

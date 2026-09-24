@@ -21,7 +21,7 @@ cargo run --release -- render path/to/strokes.json equation.png '\frac{\mathrm{d
 
 A stroke profile is not bundled; create or import one with `handwriting-collector.html` and export it as JSON. The renderer also accepts v1 profiles. Latin letters and digits support 1–3 samples; other glyphs need one. A fixed `--seed` produces byte-identical output: it selects the starting sample for repeated glyphs and seeds the small per-instance variation in size, slant, baseline, and stroke weight. See [the stroke-file format](docs/stroke-file.md) and [examples](examples/README.md).
 
-For a higher-resolution PNG with the same layout, add `--scale 3` to the render command (supported values: 1–4).
+For a higher-resolution PNG with the same layout, add `--scale 3` to the render command (supported values: 1–16). Large images are still subject to a pixel-count limit.
 
 ## MCP server
 
