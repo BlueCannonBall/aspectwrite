@@ -146,6 +146,7 @@ const UNIT: f32 = 0.48; // 145 source-pixel capital -> 70 output pixels
 const GAP: f32 = 4.5;
 const TEXT_GAP: f32 = 6.5;
 const DIGIT_GAP: f32 = 9.0;
+const SUBSCRIPT_INK_GAP: f32 = 7.0;
 const DECIMAL_POINT_GAP: f32 = 8.0;
 const ALIGNED_ROW_GAP: f32 = 36.0;
 const FRACTION_EXTRA_WIDTH: f32 = 30.0;
@@ -539,6 +540,20 @@ pub fn png(node: &Node, handwriting: &Handwriting) -> Result<Vec<u8>> {
 }
 
 pub fn png_with_seed(node: &Node, handwriting: &Handwriting, seed: u64) -> Result<Vec<u8>> {
+    png_with_seed_scaled(node, handwriting, seed, 1)
+}
+
+/// Rasterize the same stroke layout at a larger output resolution.
+pub fn png_with_seed_scaled(
+    node: &Node,
+    handwriting: &Handwriting,
+    seed: u64,
+    scale: u32,
+) -> Result<Vec<u8>> {
+    if !(1..=4).contains(&scale) {
+        return Err(RenderError("output scale must be between 1 and 4".into()));
+    }
+    let scale = scale as f32;
     let mut engine = Layout {
         hand: handwriting,
         seed,
@@ -549,8 +564,10 @@ pub fn png_with_seed(node: &Node, handwriting: &Handwriting, seed: u64) -> Resul
     let layout = engine.layout(node)?;
     let ink = &handwriting.ink;
     let margin = 22.0;
-    let w = (layout.width + margin * 2.0).ceil().max(1.0);
-    let h = (layout.above + layout.below + margin * 2.0).ceil().max(1.0);
+    let w = ((layout.width + margin * 2.0) * scale).ceil().max(1.0);
+    let h = ((layout.above + layout.below + margin * 2.0) * scale)
+        .ceil()
+        .max(1.0);
     if !w.is_finite() || !h.is_finite() || w > 16000.0 || h > 16000.0 || w * h > 40_000_000.0 {
         return Err(RenderError("image dimensions exceed safe limit".into()));
     }
@@ -569,7 +586,11 @@ pub fn png_with_seed(node: &Node, handwriting: &Handwriting, seed: u64) -> Resul
                 .pressures
                 .as_ref()
                 .map_or(ink.base, |p| ink.width(p[0]));
-            builder.push_circle(margin + x, margin + layout.above + y, width / 2.0);
+            builder.push_circle(
+                (margin + x) * scale,
+                (margin + layout.above + y) * scale,
+                width * scale / 2.0,
+            );
             if let Some(path) = builder.finish() {
                 let mut paint = Paint::default();
                 paint.set_color(Color::BLACK);
@@ -589,11 +610,11 @@ pub fn png_with_seed(node: &Node, handwriting: &Handwriting, seed: u64) -> Resul
             for (segment, values) in mark.points.windows(2).zip(pressures.windows(2)) {
                 let ((x1, y1), (x2, y2)) = (segment[0], segment[1]);
                 let mut builder = PathBuilder::new();
-                builder.move_to(margin + x1, margin + layout.above + y1);
-                builder.line_to(margin + x2, margin + layout.above + y2);
+                builder.move_to((margin + x1) * scale, (margin + layout.above + y1) * scale);
+                builder.line_to((margin + x2) * scale, (margin + layout.above + y2) * scale);
                 if let Some(path) = builder.finish() {
                     let stroke = Stroke {
-                        width: ink.width((values[0] + values[1]) * 0.5),
+                        width: ink.width((values[0] + values[1]) * 0.5) * scale,
                         line_cap: tiny_skia::LineCap::Round,
                         ..Stroke::default()
                     };
@@ -602,13 +623,13 @@ pub fn png_with_seed(node: &Node, handwriting: &Handwriting, seed: u64) -> Resul
             }
         } else {
             let (x, y) = mark.points[0];
-            builder.move_to(margin + x, margin + layout.above + y);
+            builder.move_to((margin + x) * scale, (margin + layout.above + y) * scale);
             for (x, y) in mark.points.into_iter().skip(1) {
-                builder.line_to(margin + x, margin + layout.above + y);
+                builder.line_to((margin + x) * scale, (margin + layout.above + y) * scale);
             }
             if let Some(path) = builder.finish() {
                 let stroke = Stroke {
-                    width: ink.base,
+                    width: ink.base * scale,
                     line_cap: tiny_skia::LineCap::Round,
                     line_join: tiny_skia::LineJoin::Round,
                     ..Stroke::default()
@@ -1039,13 +1060,24 @@ impl Layout<'_> {
                 let dx = base.width - 2.0;
                 let sy = -base.above.max(34.0) + 10.0;
                 let uy = base.below.max(8.0) + 6.0;
-                let script_width = sup
+                // A sampled letter can reach right to its box edge, and a
+                // subscript digit can begin at its left edge. Reserve a gap
+                // between the actual strokes rather than relying on box padding.
+                let sub_x = sub.as_ref().map_or(dx, |b| {
+                    match (ink_extent(&base, |p| p.0), ink_extent(b, |p| p.0)) {
+                        (Some((_, base_right)), Some((sub_left, _))) => {
+                            dx.max(base_right - sub_left + SUBSCRIPT_INK_GAP)
+                        }
+                        _ => dx,
+                    }
+                });
+                let script_right = sup
                     .as_ref()
-                    .map_or(0.0, |b| b.width)
-                    .max(sub.as_ref().map_or(0.0, |b| b.width));
+                    .map_or(dx, |b| dx + b.width)
+                    .max(sub.as_ref().map_or(dx, |b| sub_x + b.width));
                 let base_script_drop = base.script_drop;
                 let mut out = Box2 {
-                    width: dx + script_width + 5.0,
+                    width: script_right + 5.0,
                     above: base.above,
                     below: base.below,
                     script_drop: base_script_drop,
@@ -1060,7 +1092,7 @@ impl Layout<'_> {
                 if let Some(b) = sub {
                     out.below = out.below.max(uy + b.below);
                     out.script_drop = out.script_drop.max(uy + b.script_drop);
-                    out.add(b.translated(dx, uy));
+                    out.add(b.translated(sub_x, uy));
                 }
                 Ok(out)
             }
@@ -1679,6 +1711,30 @@ mod tests {
         assert!(heights[sub] / widths[sub] < heights[sup] / widths[sup]);
         let subscript_baseline = scripts.marks[sub + 1].points[1].1;
         assert!((10.0..18.0).contains(&subscript_baseline));
+    }
+
+    #[test]
+    fn subscript_ink_clears_the_base_across_variants() {
+        let hand = fixture();
+        for seed in 0..32 {
+            let drawn = varied(&hand, seed)
+                .layout(&parse(r"x_{1}^{1}").unwrap())
+                .unwrap();
+            let base_right = drawn.marks[0]
+                .points
+                .iter()
+                .map(|p| p.0)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let sub_left = drawn.marks[2]
+                .points
+                .iter()
+                .map(|p| p.0)
+                .fold(f32::INFINITY, f32::min);
+            assert!(
+                sub_left - base_right >= SUBSCRIPT_INK_GAP - 0.01,
+                "seed {seed}: subscript is too close to its base"
+            );
+        }
     }
 
     #[test]
