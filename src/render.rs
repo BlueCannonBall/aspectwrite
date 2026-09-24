@@ -39,6 +39,7 @@ struct Bounds {
 struct Point {
     x: f32,
     y: f32,
+    p: Option<f32>,
 }
 
 #[derive(Debug)]
@@ -103,15 +104,31 @@ impl Handwriting {
         }
         Ok(g)
     }
+
+    fn recorded_parenthesis_width(&self, key: &str) -> Option<f32> {
+        if key != "(" && key != ")" {
+            return None;
+        }
+        let glyph = self.lookup(key).ok()?;
+        glyph
+            .variants
+            .iter()
+            .filter_map(|v| v.bbox.as_ref())
+            .chain(glyph.bbox.iter())
+            .map(|bb| (bb.max_x - bb.min_x) * UNIT)
+            .reduce(f32::max)
+    }
 }
 
 const UNIT: f32 = 0.48; // 145 source-pixel capital -> 70 output pixels
-const GAP: f32 = 5.0;
+const GAP: f32 = 4.5;
+const TEXT_GAP: f32 = 6.5;
 // Geometry may shrink for scripts and fractions, but ink width never does.
-const INK_WIDTH: f32 = 2.3;
+const INK_WIDTH: f32 = 1.7;
 #[derive(Clone)]
 struct Mark {
     points: Vec<(f32, f32)>,
+    pressures: Option<Vec<f32>>,
     parenthesis: bool,
 }
 #[derive(Clone)]
@@ -153,21 +170,107 @@ impl Box2 {
         }
         self
     }
+    fn scaled_vertically(mut self, factor: f32) -> Self {
+        self.above *= factor;
+        self.below *= factor;
+        for mark in &mut self.marks {
+            for point in &mut mark.points {
+                point.1 *= factor;
+            }
+        }
+        self
+    }
     fn add(&mut self, other: Self) {
         self.marks.extend(other.marks);
     }
     fn line(&mut self, points: Vec<(f32, f32)>) {
         self.marks.push(Mark {
             points,
+            pressures: None,
             parenthesis: false,
         });
     }
     fn parenthesis(&mut self, points: Vec<(f32, f32)>) {
+        let last = (points.len() - 1) as f32;
+        let pressures = (0..points.len())
+            .map(|i| 0.15 + 0.38 * (std::f32::consts::PI * i as f32 / last).sin())
+            .collect();
         self.marks.push(Mark {
             points,
+            pressures: Some(pressures),
             parenthesis: true,
         });
     }
+}
+
+fn body_bounds(box2: &Box2) -> Option<(f32, f32)> {
+    let points = box2.marks.iter().flat_map(|mark| &mark.points);
+    let body: Vec<_> = points
+        .clone()
+        .filter(|(_, y)| (-65.0..=-5.0).contains(y))
+        .map(|(x, _)| *x)
+        .collect();
+    let xs: Vec<_> = if body.is_empty() {
+        points.map(|(x, _)| *x).collect()
+    } else {
+        body
+    };
+    Some((
+        xs.iter().copied().reduce(f32::min)?,
+        xs.iter().copied().reduce(f32::max)?,
+    ))
+}
+
+fn point_segment_distance_squared(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let t = if dx * dx + dy * dy > 0.0 {
+        ((p.0 - a.0) * dx + (p.1 - a.1) * dy) / (dx * dx + dy * dy)
+    } else {
+        0.0
+    }
+    .clamp(0.0, 1.0);
+    (p.0 - a.0 - t * dx).powi(2) + (p.1 - a.1 - t * dy).powi(2)
+}
+
+fn segment_distance_squared(a: (f32, f32), b: (f32, f32), c: (f32, f32), d: (f32, f32)) -> f32 {
+    let cross = |p: (f32, f32), q: (f32, f32), r: (f32, f32)| {
+        (q.0 - p.0) * (r.1 - p.1) - (q.1 - p.1) * (r.0 - p.0)
+    };
+    if cross(a, b, c) * cross(a, b, d) <= 0.0
+        && cross(c, d, a) * cross(c, d, b) <= 0.0
+        && a.0.min(b.0) <= c.0.max(d.0)
+        && c.0.min(d.0) <= a.0.max(b.0)
+        && a.1.min(b.1) <= c.1.max(d.1)
+        && c.1.min(d.1) <= a.1.max(b.1)
+    {
+        return 0.0;
+    }
+    point_segment_distance_squared(a, c, d)
+        .min(point_segment_distance_squared(b, c, d))
+        .min(point_segment_distance_squared(c, a, b))
+        .min(point_segment_distance_squared(d, a, b))
+}
+
+fn ink_is_too_close(a: &Box2, b: &Box2, offset: f32, clearance: f32) -> bool {
+    a.marks.iter().any(|left| {
+        left.points
+            .iter()
+            .zip(left.points.iter().skip(1).chain(left.points.last()))
+            .any(|(&start, &end)| {
+                b.marks.iter().any(|right| {
+                    right
+                        .points
+                        .iter()
+                        .zip(right.points.iter().skip(1).chain(right.points.last()))
+                        .any(|(&first, &last)| {
+                            let first = (first.0 + offset, first.1);
+                            let last = (last.0 + offset, last.1);
+                            segment_distance_squared(start, end, first, last)
+                                < clearance * clearance
+                        })
+                })
+            })
+    })
 }
 
 // Subtle deterministic asymmetry: neighboring brackets don't look stamped,
@@ -187,6 +290,11 @@ fn vary_parenthesis(mark: &mut Mark) {
         point.0 += envelope * (belly + skew * (2.0 * t - 1.0));
         point.1 += envelope * rise;
     }
+}
+
+fn pressure_width(pressure: f32) -> f32 {
+    let p = pressure.clamp(0.0, 1.0);
+    0.35 + 1.15 * p + 1.55 * p * p
 }
 
 pub fn png(node: &Node, handwriting: &Handwriting) -> Result<Vec<u8>> {
@@ -217,7 +325,11 @@ pub fn png_with_seed(node: &Node, handwriting: &Handwriting, seed: u64) -> Resul
         let mut builder = PathBuilder::new();
         if mark.points.len() == 1 {
             let (x, y) = mark.points[0];
-            builder.push_circle(margin + x, margin + layout.above + y, INK_WIDTH / 2.0);
+            let width = mark
+                .pressures
+                .as_ref()
+                .map_or(INK_WIDTH, |p| pressure_width(p[0]));
+            builder.push_circle(margin + x, margin + layout.above + y, width / 2.0);
             if let Some(path) = builder.finish() {
                 let mut paint = Paint::default();
                 paint.set_color(Color::BLACK);
@@ -229,6 +341,24 @@ pub fn png_with_seed(node: &Node, handwriting: &Handwriting, seed: u64) -> Resul
                     Transform::identity(),
                     None,
                 );
+            }
+        } else if let Some(pressures) = &mark.pressures {
+            let mut paint = Paint::default();
+            paint.set_color(Color::BLACK);
+            paint.anti_alias = true;
+            for (segment, values) in mark.points.windows(2).zip(pressures.windows(2)) {
+                let ((x1, y1), (x2, y2)) = (segment[0], segment[1]);
+                let mut builder = PathBuilder::new();
+                builder.move_to(margin + x1, margin + layout.above + y1);
+                builder.line_to(margin + x2, margin + layout.above + y2);
+                if let Some(path) = builder.finish() {
+                    let stroke = Stroke {
+                        width: pressure_width((values[0] + values[1]) * 0.5),
+                        line_cap: tiny_skia::LineCap::Round,
+                        ..Stroke::default()
+                    };
+                    pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+                }
             }
         } else {
             let (x, y) = mark.points[0];
@@ -308,11 +438,13 @@ impl Layout<'_> {
     }
 
     fn glyph(&mut self, key: &str) -> Result<Box2> {
-        // Literal delimiters are procedural too: no parenthesis/bracket/bar
-        // was requested from the collector, even at a fixed height.
-        if ["(", ")", "[", "]", "|"].contains(&key) {
+        // Use collected parentheses when available; other literal delimiters
+        // (and parentheses in older profiles) remain procedural.
+        if ["(", ")", "[", "]", "|"].contains(&key)
+            && self.hand.recorded_parenthesis_width(key).is_none()
+        {
             let mut out = Box2 {
-                width: 18.0,
+                width: 22.0,
                 above: 49.0,
                 below: 19.0,
                 marks: vec![],
@@ -325,7 +457,7 @@ impl Layout<'_> {
                 49.0,
                 19.0,
                 key == "(" || key == "[",
-            );
+            )?;
             return Ok(out);
         }
         if key == "\\cdots" || key == "\\ldots" {
@@ -400,11 +532,13 @@ impl Layout<'_> {
                 .iter()
                 .map(|p| ((p.x - bb.min_x) * UNIT, -p.y * UNIT))
                 .collect();
+            let pressures = stroke.iter().map(|p| p.p).collect::<Option<Vec<_>>>();
             if points.iter().any(|(x, y)| !x.is_finite() || !y.is_finite()) {
                 return Err(RenderError(format!("invalid stroke point in {key}")));
             }
             out.marks.push(Mark {
                 points,
+                pressures,
                 parenthesis: false,
             });
         }
@@ -434,11 +568,11 @@ impl Layout<'_> {
                 Ok(out)
             }
             Node::Fraction(a, b) => {
-                let top = self.layout(a)?.scaled(0.83);
-                let bottom = self.layout(b)?.scaled(0.83);
-                let width = top.width.max(bottom.width) + 20.0;
+                let top = self.layout(a)?.scaled(0.55);
+                let bottom = self.layout(b)?.scaled(0.55);
+                let width = top.width.max(bottom.width) + 14.0;
                 let axis = -self.math_axis();
-                let (ty, by) = (axis - 10.0 - top.below, axis + 10.0 + bottom.above);
+                let (ty, by) = (axis - 4.5 - top.below, axis + 4.5 + bottom.above);
                 let mut out = Box2 {
                     width,
                     above: (-ty + top.above).max(0.0),
@@ -450,7 +584,7 @@ impl Layout<'_> {
                 let bx = (width - bottom.width) / 2.0;
                 out.add(top.translated(tx, ty));
                 out.add(bottom.translated(bx, by));
-                out.line(vec![(4.0, axis), (width - 4.0, axis)]);
+                out.line(vec![(2.0, axis), (width - 2.0, axis)]);
                 Ok(out)
             }
             Node::Root(index, body) => {
@@ -483,11 +617,17 @@ impl Layout<'_> {
                 let base = self.layout(base)?;
                 let sub = sub
                     .as_deref()
-                    .map(|n| self.layout(n).map(|b| b.scaled(0.65)))
+                    .map(|n| {
+                        self.layout(n)
+                            .map(|b| b.scaled(0.50).scaled_vertically(0.82))
+                    })
                     .transpose()?;
                 let sup = sup
                     .as_deref()
-                    .map(|n| self.layout(n).map(|b| b.scaled(0.65)))
+                    .map(|n| {
+                        self.layout(n)
+                            .map(|b| b.scaled(0.55).scaled_vertically(0.85))
+                    })
                     .transpose()?;
                 if base.large {
                     let width = base
@@ -522,7 +662,7 @@ impl Layout<'_> {
                 }
                 let dx = base.width - 2.0;
                 let sy = -base.above.max(34.0) + 10.0;
-                let uy = base.below.max(8.0) + 18.0;
+                let uy = base.below.max(8.0) + 6.0;
                 let script_width = sup
                     .as_ref()
                     .map_or(0.0, |b| b.width)
@@ -597,17 +737,25 @@ impl Layout<'_> {
                 let b = self.layout(n)?;
                 let above = b.above.max(42.0) + 5.0;
                 let below = b.below.max(16.0) + 5.0;
+                let left_slot = self
+                    .hand
+                    .recorded_parenthesis_width(left)
+                    .map_or(20.0, |w| (w + 6.0).max(20.0));
+                let right_slot = self
+                    .hand
+                    .recorded_parenthesis_width(right)
+                    .map_or(20.0, |w| (w + 6.0).max(20.0));
                 let mut out = Box2 {
-                    width: b.width + 30.0,
+                    width: b.width + left_slot + right_slot,
                     above,
                     below,
                     marks: vec![],
                     large: false,
                 };
-                out.add(b.translated(15.0, 0.0));
-                self.delim(&mut out, left, 5.0, above, below, true);
-                let right_x = out.width - 11.0;
-                self.delim(&mut out, right, right_x, above, below, false);
+                let right_x = left_slot + b.width + 6.0;
+                out.add(b.translated(left_slot, 0.0));
+                self.delim(&mut out, left, left_slot - 6.0, above, below, true)?;
+                self.delim(&mut out, right, right_x, above, below, false)?;
                 Ok(out)
             }
             Node::Arrow(key, label) => {
@@ -671,10 +819,11 @@ impl Layout<'_> {
     }
     fn text(&mut self, text: &str) -> Result<Box2> {
         let mut out = Box2::empty();
+        let mut word: Vec<(Box2, f32)> = Vec::new();
         for ch in text.chars() {
             let b = if ch == ' ' {
                 Box2 {
-                    width: 32.0,
+                    width: 24.0,
                     ..Box2::empty()
                 }
             } else if ch == '%' {
@@ -684,18 +833,76 @@ impl Layout<'_> {
             };
             out.above = out.above.max(b.above);
             out.below = out.below.max(b.below);
-            let x = out.width;
-            out.width += b.width;
+            let mut x = out.width;
+            if ch.is_ascii_alphabetic()
+                && let Some((prior, prior_x)) = word.last()
+                && let (Some((_, prior_right)), Some((current_left, _))) =
+                    (body_bounds(prior), body_bounds(&b))
+            {
+                x = prior_x + prior_right + TEXT_GAP - current_left;
+                // Check the full strokes as well as the letter bodies: an
+                // overhanging stroke can otherwise touch any earlier letter.
+                while word.iter().any(|(earlier, earlier_x)| {
+                    earlier_x + earlier.width + TEXT_GAP >= x
+                        && ink_is_too_close(earlier, &b, x - earlier_x, TEXT_GAP)
+                }) {
+                    x += 0.5;
+                }
+            }
+            out.width = out.width.max(x + b.width);
+            if ch.is_ascii_alphabetic() {
+                word.push((b.clone(), x));
+            } else {
+                word.clear();
+            }
             out.add(b.translated(x, 0.0));
         }
         Ok(out)
     }
-    fn delim(&self, out: &mut Box2, token: &str, x: f32, up: f32, down: f32, opening: bool) {
+    fn delim(
+        &mut self,
+        out: &mut Box2,
+        token: &str,
+        x: f32,
+        up: f32,
+        down: f32,
+        opening: bool,
+    ) -> Result<()> {
         if token == "." {
-            return;
+            return Ok(());
         }
         let top = -up;
         let bot = down;
+        if let Some(width) = self.hand.recorded_parenthesis_width(token) {
+            let mut sample = self.glyph(token)?;
+            let min_y = sample
+                .marks
+                .iter()
+                .flat_map(|m| &m.points)
+                .map(|p| p.1)
+                .fold(f32::INFINITY, f32::min);
+            let max_y = sample
+                .marks
+                .iter()
+                .flat_map(|m| &m.points)
+                .map(|p| p.1)
+                .fold(f32::NEG_INFINITY, f32::max);
+            if max_y - min_y < 1.0 {
+                return Err(RenderError(format!(
+                    "parenthesis {token} needs a stroke with vertical height"
+                )));
+            }
+            let scale_y = (bot - top) / (max_y - min_y);
+            let start_x = if opening { x - width } else { x };
+            for mark in &mut sample.marks {
+                for point in &mut mark.points {
+                    point.0 += start_x;
+                    point.1 = top + (point.1 - min_y) * scale_y;
+                }
+            }
+            out.add(sample);
+            return Ok(());
+        }
         let mid = (top + bot) / 2.0;
         let kind = match token {
             "(" | ")" => "round",
@@ -707,10 +914,11 @@ impl Layout<'_> {
         match kind {
             "round" => {
                 let mut pts = Vec::new();
+                let amplitude = ((up + down) * 0.14).clamp(8.0, 15.0);
                 for i in 0..=20 {
                     let t = i as f32 / 20.0;
                     let y = top + (bot - top) * t;
-                    let bulge = (1.0 - (2.0 * t - 1.0).powi(2)).max(0.0) * 8.0;
+                    let bulge = (std::f32::consts::PI * t).sin() * amplitude;
                     pts.push((x + if opening { -bulge } else { bulge }, y));
                 }
                 out.parenthesis(pts);
@@ -738,6 +946,7 @@ impl Layout<'_> {
                 ]);
             }
         }
+        Ok(())
     }
 }
 
@@ -782,12 +991,50 @@ mod tests {
         let bar = fraction
             .marks
             .iter()
-            .find(|m| m.points.first().is_some_and(|p| p.0 == 4.0))
+            .find(|m| m.points.first().is_some_and(|p| p.0 == 2.0))
             .unwrap();
         let equals = layout.glyph("=").unwrap();
         let equals_center = (equals.marks[0].points[0].1 + equals.marks[0].points[1].1) / 2.0;
         assert!((bar.points[0].1 - equals_center).abs() < 0.1);
-        assert!(fraction.below > 0.0); // denominator can descend below the baseline
+        let full_digit = layout.glyph("1").unwrap();
+        let small_fraction = layout.layout(&parse(r"\frac{1}{1}").unwrap()).unwrap();
+        let ratio =
+            (small_fraction.above + small_fraction.below) / (full_digit.above + full_digit.below);
+        assert!(
+            (1.0..1.3).contains(&ratio),
+            "fraction/full digit height: {ratio}"
+        );
+    }
+
+    #[test]
+    fn both_scripts_are_small_and_subscripts_are_tucked_under_the_base() {
+        let hand = fixture();
+        let mut layout = Layout {
+            hand: &hand,
+            seed: 0,
+            occurrences: HashMap::new(),
+        };
+        let scripts = layout.layout(&parse(r"x_{1}^{1}").unwrap()).unwrap();
+        // Both scripts use the same digit sample. Subscripts should be
+        // slightly smaller than superscripts and near the base.
+        let widths: Vec<_> = scripts.marks[1..]
+            .iter()
+            .map(|m| (m.points[1].0 - m.points[0].0).abs())
+            .collect();
+        let heights: Vec<_> = scripts.marks[1..]
+            .iter()
+            .map(|m| (m.points[1].1 - m.points[0].1).abs())
+            .collect();
+        let (sup, sub) = if scripts.marks[1].points[0].1 < scripts.marks[2].points[0].1 {
+            (0, 1)
+        } else {
+            (1, 0)
+        };
+        assert!(widths[sub] < widths[sup]);
+        assert!(heights[sub] < heights[sup]);
+        assert!(heights[sub] / widths[sub] < heights[sup] / widths[sup]);
+        let subscript_baseline = scripts.marks[sub + 1].points[1].1;
+        assert!((10.0..18.0).contains(&subscript_baseline));
     }
 
     #[test]
@@ -922,6 +1169,80 @@ mod tests {
     }
 
     #[test]
+    fn taller_parentheses_curve_more_and_have_tapered_ends() {
+        let hand = fixture();
+        let mut layout = Layout {
+            hand: &hand,
+            seed: 0,
+            occurrences: HashMap::new(),
+        };
+        let plain = layout.layout(&parse(r"\left(1\right)").unwrap()).unwrap();
+        let fraction = layout
+            .layout(&parse(r"\left(\frac{1}{1}\right)").unwrap())
+            .unwrap();
+        let small = plain.marks.iter().find(|m| m.parenthesis).unwrap();
+        let large = fraction.marks.iter().find(|m| m.parenthesis).unwrap();
+        assert!(large.points[0].1 < small.points[0].1);
+        assert!(large.points[0].0 - large.points[10].0 > small.points[0].0 - small.points[10].0);
+        let widths = large.pressures.as_ref().unwrap();
+        assert!(pressure_width(widths[0]) < pressure_width(widths[10]));
+        assert!(pressure_width(widths[20]) < pressure_width(widths[10]));
+    }
+
+    #[test]
+    fn collected_parentheses_keep_their_horizontal_shape_at_different_heights() {
+        let mut hand = fixture();
+        for key in ["(", ")"] {
+            let glyph: Glyph = serde_json::from_value(serde_json::json!({
+                "key": key, "status": "complete",
+                "variants": [{
+                    "baseline": 0,
+                    "bbox": {"minX": 10, "maxX": 50, "minY": -20, "maxY": 100},
+                    "strokes": [[
+                        {"x": 50, "y": 100, "p": 0.1},
+                        {"x": 10, "y": 40, "p": 0.7},
+                        {"x": 50, "y": -20, "p": 0.1}
+                    ]]
+                }]
+            }))
+            .unwrap();
+            hand.glyphs.insert(key.into(), glyph);
+        }
+        let mut layout = Layout {
+            hand: &hand,
+            seed: 0,
+            occurrences: HashMap::new(),
+        };
+        let normal = layout.layout(&parse(r"\left(1\right)").unwrap()).unwrap();
+        let tall = layout
+            .layout(&parse(r"\left(\frac{1}{1}\right)").unwrap())
+            .unwrap();
+        fn opening(marks: &[Mark]) -> &Mark {
+            marks
+                .iter()
+                .find(|m| m.pressures.as_ref().is_some_and(|p| p[1] == 0.7))
+                .unwrap()
+        }
+        let normal_mark = opening(&normal.marks);
+        let tall_mark = opening(&tall.marks);
+        assert_eq!(normal_mark.points.len(), 3);
+        assert!(!normal_mark.parenthesis);
+        assert!(
+            (normal_mark.points[0].0
+                - normal_mark.points[1].0
+                - (tall_mark.points[0].0 - tall_mark.points[1].0))
+                .abs()
+                < 0.01
+        );
+        assert!(
+            tall_mark.points[2].1 - tall_mark.points[0].1
+                > normal_mark.points[2].1 - normal_mark.points[0].1
+        );
+        assert_eq!(normal_mark.pressures.as_ref().unwrap(), &[0.1, 0.7, 0.1]);
+        assert_eq!(layout.glyph("(").unwrap().marks[0].points.len(), 3);
+    }
+
+    #[test]
     fn integral_limits_clear_ink_and_prose_has_word_gaps() {
         let hand = fixture();
         let mut layout = Layout {
@@ -935,6 +1256,72 @@ mod tests {
         assert!(limits.below > integral.below + 10.0);
         let one_word = layout.text("xx").unwrap();
         let two_words = layout.text("x x").unwrap();
-        assert!((two_words.width - one_word.width - 32.0).abs() < 0.1);
+        assert!(two_words.width > one_word.width + 10.0);
+    }
+
+    #[test]
+    fn text_spacing_ignores_descender_overhang_without_touching_ink() {
+        let mut hand = fixture();
+        for (key, strokes) in [
+            (
+                "a",
+                serde_json::json!([[{"x":0,"y":50},{"x":20,"y":40}], [{"x":50,"y":-60}]]),
+            ),
+            (
+                "b",
+                serde_json::json!([[{"x":0,"y":140}], [{"x":30,"y":40},{"x":50,"y":50}]]),
+            ),
+        ] {
+            let glyph: Glyph = serde_json::from_value(serde_json::json!({
+                "key":key, "status":"complete",
+                "bbox":{"minX":0,"maxX":50,"minY":-60,"maxY":140},
+                "strokes":strokes
+            }))
+            .unwrap();
+            hand.glyphs.insert(key.into(), glyph);
+        }
+        let mut layout = Layout {
+            hand: &hand,
+            seed: 0,
+            occurrences: HashMap::new(),
+        };
+        let text = layout.text("ab").unwrap();
+        let first = text.marks[0].points[1].0;
+        let second = text.marks[3].points[0].0;
+        // These body points are 20 source pixels apart within each glyph;
+        // distant ascenders/descenders must not leave a huge word gap.
+        assert!((second - first - TEXT_GAP).abs() < 0.6);
+    }
+
+    #[test]
+    fn crossing_strokes_are_detected_between_sampled_points() {
+        let a = (0.0, 0.0);
+        let b = (10.0, 10.0);
+        let c = (0.0, 10.0);
+        let d = (10.0, 0.0);
+        assert_eq!(segment_distance_squared(a, b, c, d), 0.0);
+        assert!(segment_distance_squared(a, b, (20.0, 0.0), (30.0, 0.0)) > 0.0);
+    }
+
+    #[test]
+    fn pressure_is_preserved_for_ink_and_optional_for_old_profiles() {
+        let mut hand = fixture();
+        let glyph = hand.glyphs.get_mut("x").unwrap();
+        glyph.strokes[0][0].p = Some(0.1);
+        glyph.strokes[0][1].p = Some(0.9);
+        let mut layout = Layout {
+            hand: &hand,
+            seed: 0,
+            occurrences: HashMap::new(),
+        };
+        assert_eq!(
+            layout.glyph("x").unwrap().marks[0].pressures,
+            Some(vec![0.1, 0.9])
+        );
+        assert!(pressure_width(0.1) < 0.6);
+        assert!(pressure_width(0.6) < 1.7);
+        assert!(pressure_width(0.9) > 2.5);
+        assert!(pressure_width(1.0) > 3.0);
+        assert_eq!(layout.glyph("T").unwrap().marks[0].pressures, None);
     }
 }

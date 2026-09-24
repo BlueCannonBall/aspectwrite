@@ -210,6 +210,7 @@
         <canvas id="drawingCanvas" width="800" height="320" aria-label="Drawing canvas"></canvas>
       </div>
       <p class="canvas-help">Use a mouse, pen, or finger. Draw only the requested glyph; the guide lines are not exported.</p>
+      <label><input id="allowTouchDrawing" type="checkbox" checked> Allow touch drawing (turn off when using a pen)</label>
 
       <div class="toolbar">
         <button id="previousButton" type="button">Previous</button>
@@ -246,8 +247,11 @@
       <details>
         <summary>What is not collected?</summary>
         <p>
-          Braces, parentheses, brackets, bars, and angle delimiters are omitted
-          because they need to scale around fractions and roots. Fraction bars,
+          Braces, brackets, bars, and angle delimiters are omitted
+          because they need to scale around fractions and roots. Parentheses can
+          be collected; draw each around a capital-height glyph, from above the
+          upper guide to just below the baseline. The renderer stretches them
+          vertically to fit their contents. Fraction bars,
           radical bars, accent strokes, and other layout primitives are also not
           separate prompts. Named operators such as sin and lim are composed
           from the collected Latin letters. Equivalent LaTeX command aliases
@@ -324,6 +328,8 @@
       ...letters("Lowercase letters", "abcdefghijklmnopqrstuvwxyz"),
       ...letters("Digits", "0123456789"),
       ...punctuation,
+      ...["(", ")"].map(key => makeItem(key, key, "Parentheses", "literal", key, [],
+        "Draw a natural parenthesis around a capital-height character; it will be resized vertically around expressions")),
       ...commands("Punctuation", [["%", "%", [], "Percent sign"]]),
       ...commands("Greek letters", [
         ["alpha", "α"], ["beta", "β"], ["gamma", "γ"], ["delta", "δ"],
@@ -401,6 +407,7 @@
     }
 
     const canvas = document.getElementById("drawingCanvas");
+    const allowTouchDrawing = document.getElementById("allowTouchDrawing");
     const context = canvas.getContext("2d");
     const categoryElement = document.getElementById("category");
     const previewElement = document.getElementById("symbolPreview");
@@ -429,6 +436,8 @@
     let currentIndex = 0;
     let currentStrokes = [];
     let activeStroke = null;
+    let activePointerId = null;
+    let activePointerType = null;
     let strokeStartTime = 0;
     let storageAvailable = false;
     const samples = new Map();
@@ -555,6 +564,7 @@
         window.localStorage.setItem(STORAGE_KEY, JSON.stringify({
           version: 2,
           currentIndex,
+          allowTouchDrawing: allowTouchDrawing.checked,
           samples: draftObject
         }));
         return true;
@@ -571,6 +581,7 @@
       try {
         const saved = JSON.parse(window.localStorage.getItem(STORAGE_KEY) || "null");
         if (!saved || ![1, 2].includes(saved.version) || !saved.samples) return;
+        if (typeof saved.allowTouchDrawing === "boolean") allowTouchDrawing.checked = saved.allowTouchDrawing;
         for (const item of items) {
           const draft = saved.samples[item.key];
           if (!draft) continue;
@@ -590,6 +601,8 @@
 
     function loadCurrent() {
       activeStroke = null;
+      activePointerId = null;
+      activePointerType = null;
       variantIndex = Math.min(variantIndex, currentDraft().variants.length);
       currentStrokes = rawStrokes(currentDraft().variants[variantIndex]?.strokes || []);
       renderCanvas();
@@ -716,9 +729,14 @@
       activeStroke.push({
         x: point.x,
         y: point.y,
-        t: performance.now() - strokeStartTime,
+        t: Math.max(0, (Number.isFinite(event.timeStamp) ? event.timeStamp : performance.now()) - strokeStartTime),
         p: event.pressure > 0 ? event.pressure : .5
       });
+    }
+
+    function addEventPoints(event) {
+      const coalesced = typeof event.getCoalescedEvents === "function" ? event.getCoalescedEvents() : null;
+      for (const sample of coalesced?.length ? coalesced : [event]) addPoint(sample);
       renderCanvas();
     }
 
@@ -727,6 +745,8 @@
       addPoint(event);
       if (activeStroke.length > 0) currentStrokes.push(activeStroke);
       activeStroke = null;
+      activePointerId = null;
+      activePointerType = null;
       saveCurrent();
       renderCanvas();
       updateUI();
@@ -954,31 +974,48 @@
     }
 
     canvas.addEventListener("pointerdown", event => {
-      if (event.button !== undefined && event.button !== 0) return;
+      if (activeStroke || (event.pointerType === "touch" && !allowTouchDrawing.checked) || (event.button !== undefined && event.button !== 0)) return;
       event.preventDefault();
       canvas.setPointerCapture(event.pointerId);
       activeStroke = [];
-      strokeStartTime = performance.now();
+      activePointerId = event.pointerId;
+      activePointerType = event.pointerType;
+      strokeStartTime = Number.isFinite(event.timeStamp) ? event.timeStamp : performance.now();
       addPoint(event);
+      renderCanvas();
       updateUI();
     });
     canvas.addEventListener("pointermove", event => {
-      if (!activeStroke) return;
+      if (!activeStroke || event.pointerId !== activePointerId) return;
       event.preventDefault();
-      addPoint(event);
+      addEventPoints(event);
     });
     canvas.addEventListener("pointerup", event => {
+      if (!activeStroke || event.pointerId !== activePointerId) return;
       event.preventDefault();
       finishStroke(event);
       if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
     });
     canvas.addEventListener("pointercancel", event => {
-      if (activeStroke) {
+      if (!activeStroke || event.pointerId !== activePointerId) return;
+      activeStroke = null;
+      activePointerId = null;
+      activePointerType = null;
+      renderCanvas();
+      updateUI();
+      if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+    });
+    allowTouchDrawing.addEventListener("change", () => {
+      if (!allowTouchDrawing.checked && activePointerType === "touch") {
+        const pointerId = activePointerId;
         activeStroke = null;
+        activePointerId = null;
+        activePointerType = null;
+        if (canvas.hasPointerCapture(pointerId)) canvas.releasePointerCapture(pointerId);
         renderCanvas();
         updateUI();
       }
-      if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+      persistSession();
     });
 
     previousButton.addEventListener("click", () => goTo(currentIndex - 1));

@@ -273,12 +273,10 @@ The following delimiter tokens are accepted after `\left` or `\right`:
 \langle  \rangle  \lvert  \rvert  .
 ```
 
-Delimiters are intentionally **not** part of the fixed glyph set collected
-from the user. The collector will not ask for parentheses, brackets, braces,
-or angle delimiters. The renderer will draw them with a small parametric
-stroke using the current handwritten width and line height, so they can scale
-around a fraction or root. This is the one planned procedural fallback; all
-other visible fixed-size symbols come from the stroke file.
+The collector optionally gathers `(` and `)` from the user. When present,
+their strokes are scaled vertically around the enclosed expression; otherwise
+the renderer draws procedural parentheses. Brackets, braces, bars, and angle
+delimiters remain procedural so they can scale around a fraction or root.
 
 ## Intended examples
 
