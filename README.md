@@ -19,7 +19,7 @@ cargo build --release
 cargo run --release -- render path/to/strokes.json equation.png '\frac{\mathrm{d}y}{\mathrm{d}x}=ky' --seed 7
 ```
 
-A stroke profile is not bundled; create or import one with `handwriting-collector.html` and export it as JSON. The renderer also accepts v1 profiles. Latin letters and digits support 1–3 samples; other glyphs need one. A fixed `--seed` produces byte-identical output and selects the starting sample for repeated glyphs. See [the stroke-file format](docs/stroke-file.md) and [examples](examples/README.md).
+A stroke profile is not bundled; create or import one with `handwriting-collector.html` and export it as JSON. The renderer also accepts v1 profiles. Latin letters and digits support 1–3 samples; other glyphs need one. A fixed `--seed` produces byte-identical output: it selects the starting sample for repeated glyphs and seeds the small per-instance variation in size, slant, baseline, and stroke weight. See [the stroke-file format](docs/stroke-file.md) and [examples](examples/README.md).
 
 ## MCP server
 
