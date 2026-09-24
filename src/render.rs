@@ -233,6 +233,11 @@ struct Box2 {
     width: f32,
     above: f32,
     below: f32,
+    /// Depth below this box's own baseline of the deepest subscript baseline,
+    /// zero when the box holds no subscripts. Fractions use it to put the bar
+    /// under the writing line, so descenders cross the bar while subscripts
+    /// rest on it.
+    script_drop: f32,
     marks: Vec<Mark>,
     large: bool,
 }
@@ -242,6 +247,7 @@ impl Box2 {
             width: 0.0,
             above: 0.0,
             below: 0.0,
+            script_drop: 0.0,
             marks: vec![],
             large: false,
         }
@@ -259,6 +265,7 @@ impl Box2 {
         self.width *= factor;
         self.above *= factor;
         self.below *= factor;
+        self.script_drop *= factor;
         for mark in &mut self.marks {
             for p in &mut mark.points {
                 p.0 *= factor;
@@ -270,6 +277,7 @@ impl Box2 {
     fn scaled_vertically(mut self, factor: f32) -> Self {
         self.above *= factor;
         self.below *= factor;
+        self.script_drop *= factor;
         for mark in &mut self.marks {
             for point in &mut mark.points {
                 point.1 *= factor;
@@ -493,6 +501,10 @@ const HAND_DRAWN_LINE_SEGMENTS: usize = 8;
 const MAX_LINE_WAVE: f32 = 0.9;
 const MAX_LINE_TILT: f32 = 0.9;
 
+/// How far a hand-drawn bar can wander from its centre line at its worst point:
+/// both wave amplitudes plus half the tilt.
+const MAX_BAR_WOBBLE: f32 = MAX_LINE_WAVE * 1.5 + MAX_LINE_TILT / 2.0;
+
 /// A hand-drawn straight line: a slight wave and tilt that fade to nothing at
 /// the endpoints, so the line still spans exactly the same two points.
 fn hand_drawn_line(seed: u64, placed: usize, from: (f32, f32), to: (f32, f32)) -> Vec<(f32, f32)> {
@@ -677,6 +689,7 @@ impl Layout<'_> {
                 width: 22.0,
                 above: 49.0,
                 below: 19.0,
+                script_drop: 0.0,
                 marks: vec![],
                 large: false,
             };
@@ -711,6 +724,7 @@ impl Layout<'_> {
                 width: single.width + (n - 1) as f32 * (single.width * 0.65),
                 above: single.above,
                 below: single.below,
+                script_drop: 0.0,
                 marks: vec![],
                 large: true,
             };
@@ -797,6 +811,7 @@ impl Layout<'_> {
             width: ((bb.max_x - bb.min_x) * UNIT).max(3.0) + GAP,
             above: (bb.max_y * UNIT).max(0.0),
             below: (-bb.min_y * UNIT).max(0.0),
+            script_drop: 0.0,
             marks: vec![],
             large: matches!(key, "\\int" | "\\oint" | "\\sum" | "\\prod"),
         };
@@ -854,6 +869,7 @@ impl Layout<'_> {
                     };
                     out.above = out.above.max(b.above);
                     out.below = out.below.max(b.below);
+                    out.script_drop = out.script_drop.max(b.script_drop);
                     let x = out.width + pad + group_gap + digit_gap;
                     out.width = x + b.width + pad;
                     out.add(b.translated(x, 0.0));
@@ -865,15 +881,27 @@ impl Layout<'_> {
                 let bottom = self.layout(b)?.scaled(0.55);
                 let width = top.width.max(bottom.width) + 14.0;
                 let axis = -self.math_axis();
-                // Keep all numerator ink, including subscripts and descenders,
-                // clear of the bar's hand-drawn wobble and stroke width.
-                const FRACTION_CLEARANCE: f32 = 6.0;
-                let ty = axis - FRACTION_CLEARANCE - top.below;
-                let by = axis + FRACTION_CLEARANCE + bottom.above;
+                // The bar is the writing line for the numerator: put the
+                // numerator's own baseline, or its deepest subscript baseline,
+                // just above the bar. A subscript then reads as written on the
+                // line, while its descender and any letter descender cross the
+                // bar the way they do when writing by hand.
+                //
+                // The denominator is placed by its ink top rather than its
+                // writing line, so the same distance reads as cramped; it keeps
+                // more air under the bar.
+                const FRACTION_NUMERATOR_GAP: f32 = INK_WIDTH / 2.0 + MAX_BAR_WOBBLE + 0.5;
+                const FRACTION_DENOMINATOR_GAP: f32 = FRACTION_NUMERATOR_GAP + 2.0;
+                let ty = axis - FRACTION_NUMERATOR_GAP - top.script_drop;
+                let by = axis + FRACTION_DENOMINATOR_GAP + bottom.above;
+                // A crossing descender can reach below the denominator, so the
+                // box has to grow to hold it instead of clipping it.
+                let numerator_low = ty + top.below;
                 let mut out = Box2 {
                     width,
                     above: (-ty + top.above).max(0.0),
-                    below: (by + bottom.below).max(0.0),
+                    below: (by + bottom.below).max(numerator_low).max(0.0),
+                    script_drop: 0.0,
                     marks: vec![],
                     large: false,
                 };
@@ -897,13 +925,16 @@ impl Layout<'_> {
             Node::Root(index, body) => {
                 let body = self.layout(body)?;
                 let cap = body.above.max(56.0) + 9.0;
+                let body_script_drop = body.script_drop;
                 let mut out = Box2 {
                     width: body.width + 30.0,
                     above: cap + 4.0,
                     below: body.below.max(13.0),
+                    script_drop: 0.0,
                     marks: vec![],
                     large: false,
                 };
+                out.script_drop = out.script_drop.max(body_script_drop);
                 out.add(body.translated(26.0, 0.0));
                 out.line(vec![
                     (1.0, -cap * 0.45),
@@ -950,6 +981,7 @@ impl Layout<'_> {
                         width,
                         above: base.above,
                         below: base.below,
+                        script_drop: 0.0,
                         marks: vec![],
                         large: false,
                     };
@@ -974,10 +1006,12 @@ impl Layout<'_> {
                     .as_ref()
                     .map_or(0.0, |b| b.width)
                     .max(sub.as_ref().map_or(0.0, |b| b.width));
+                let base_script_drop = base.script_drop;
                 let mut out = Box2 {
                     width: dx + script_width + 5.0,
                     above: base.above,
                     below: base.below,
+                    script_drop: base_script_drop,
                     marks: vec![],
                     large: false,
                 };
@@ -988,12 +1022,14 @@ impl Layout<'_> {
                 }
                 if let Some(b) = sub {
                     out.below = out.below.max(uy + b.below);
+                    out.script_drop = out.script_drop.max(uy + b.script_drop);
                     out.add(b.translated(dx, uy));
                 }
                 Ok(out)
             }
             Node::Accent(name, n) => {
                 let body = self.layout(n)?;
+                let body_script_drop = body.script_drop;
                 let w = body.width;
                 let under = body.below + 6.0;
                 let y = -body.above - 7.0;
@@ -1001,9 +1037,11 @@ impl Layout<'_> {
                     width: w,
                     above: body.above + 19.0,
                     below: body.below,
+                    script_drop: 0.0,
                     marks: vec![],
                     large: false,
                 };
+                out.script_drop = out.script_drop.max(body_script_drop);
                 out.add(body);
                 match name.as_str() {
                     "hat" | "widehat" => {
@@ -1056,6 +1094,7 @@ impl Layout<'_> {
                     width: b.width + left_slot + right_slot,
                     above,
                     below,
+                    script_drop: 0.0,
                     marks: vec![],
                     large: false,
                 };
@@ -1079,6 +1118,7 @@ impl Layout<'_> {
                     width,
                     above: (-y + b.above).max(arrow.above),
                     below: arrow.below,
+                    script_drop: 0.0,
                     marks: vec![],
                     large: false,
                 };
@@ -1356,7 +1396,7 @@ mod tests {
     }
 
     #[test]
-    fn numerator_descenders_and_subscripts_stay_clear_of_fraction_bar() {
+    fn fraction_bar_is_the_numerator_writing_line() {
         let mut hand = fixture();
         let glyph: Glyph = serde_json::from_value(serde_json::json!({
             "key":"g", "status":"complete",
@@ -1366,7 +1406,9 @@ mod tests {
         .unwrap();
         hand.glyphs.insert("g".into(), glyph);
 
-        for expression in [r"\frac{g}{1}", r"\frac{x_{1}}{1}"] {
+        // A subscript sits on the bar; a letter descender crosses it.
+        let cases = [(r"\frac{x_{1}}{1}", false), (r"\frac{g}{1}", true)];
+        for (expression, crosses) in cases {
             for seed in 0..32 {
                 let mut layout = varied(&hand, seed);
                 let fraction = layout.layout(&parse(expression).unwrap()).unwrap();
@@ -1381,15 +1423,46 @@ mod tests {
                     .flat_map(|mark| &mark.points)
                     .map(|point| point.1)
                     .fold(f32::NEG_INFINITY, f32::max);
-                let bar_top = fraction.marks[bar_index]
-                    .points
+                let bar = &fraction.marks[bar_index].points;
+                let bar_top = bar
                     .iter()
                     .map(|point| point.1)
                     .fold(f32::INFINITY, f32::min);
+                let bar_centre = bar.iter().map(|point| point.1).sum::<f32>() / bar.len() as f32;
+                // White space between the numerator ink and the bar ink, both
+                // measured at the bar's own worst-case wobble.
+                let visible_gap = bar_top - numerator_bottom - INK_WIDTH / 2.0;
+                if crosses {
+                    assert!(
+                        numerator_bottom > bar_centre,
+                        "{expression}, seed {seed}: the descender stops {:.2}px short of the bar",
+                        bar_centre - numerator_bottom
+                    );
+                } else {
+                    assert!(
+                        visible_gap > 0.0,
+                        "{expression}, seed {seed}: the bar slices the subscript, gap = {visible_gap}"
+                    );
+                    assert!(
+                        visible_gap < 2.5,
+                        "{expression}, seed {seed}: subscript floats {visible_gap}px above the bar"
+                    );
+                }
+                // The denominator is placed by its ink top, so it keeps more
+                // air under the bar than the numerator's writing line does.
+                let denominator_top = fraction.marks[numerator_mark_count..bar_index]
+                    .iter()
+                    .flat_map(|mark| &mark.points)
+                    .map(|point| point.1)
+                    .fold(f32::INFINITY, f32::min);
+                let bar_bottom = bar
+                    .iter()
+                    .map(|point| point.1)
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let denominator_gap = denominator_top - bar_bottom - INK_WIDTH / 2.0;
                 assert!(
-                    bar_top - numerator_bottom >= 2.5,
-                    "{expression}, seed {seed}: numerator/bar gap = {}",
-                    bar_top - numerator_bottom
+                    denominator_gap > 2.0,
+                    "{expression}, seed {seed}: denominator is cramped, gap = {denominator_gap}"
                 );
             }
         }
