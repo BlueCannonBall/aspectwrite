@@ -222,6 +222,20 @@ fn body_bounds(box2: &Box2) -> Option<(f32, f32)> {
     ))
 }
 
+/// A stroke in local glyph coordinates: laid-out points plus its optional
+/// pressure profile.
+type RawStroke = (Vec<(f32, f32)>, Option<Vec<f32>>);
+
+fn ink_extent(box2: &Box2, axis: impl Fn(&(f32, f32)) -> f32) -> Option<(f32, f32)> {
+    let mut low = f32::INFINITY;
+    let mut high = f32::NEG_INFINITY;
+    for point in box2.marks.iter().flat_map(|mark| &mark.points) {
+        low = low.min(axis(point));
+        high = high.max(axis(point));
+    }
+    (low <= high).then_some((low, high))
+}
+
 fn point_segment_distance_squared(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
     let (dx, dy) = (b.0 - a.0, b.1 - a.1);
     let t = if dx * dx + dy * dy > 0.0 {
@@ -298,6 +312,92 @@ fn pressure_width(pressure: f32) -> f32 {
     0.35 + 1.15 * p + 1.55 * p * p
 }
 
+// Per-instance variation is derived only from the seed, the glyph key and the
+// occurrence count. It must never depend on wall-clock time or on HashMap
+// iteration order, which Rust randomizes per process, or a fixed seed would
+// stop producing byte-identical output.
+const MAX_INSTANCE_ROTATION: f32 = 0.8 * std::f32::consts::PI / 180.0;
+const MAX_INSTANCE_SCALE: f32 = 0.02;
+const MAX_INSTANCE_BASELINE_OFFSET: f32 = 1.5;
+const MIN_INSTANCE_PRESSURE: f32 = 0.88;
+const MAX_INSTANCE_PRESSURE: f32 = 1.12;
+
+fn mix64(mut bits: u64) -> u64 {
+    bits ^= bits >> 30;
+    bits = bits.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    bits ^= bits >> 27;
+    bits = bits.wrapping_mul(0x94d0_49bb_1331_11eb);
+    bits ^= bits >> 31;
+    bits
+}
+
+fn instance_bits(seed: u64, key: &str, index: usize) -> u64 {
+    let mut bits = 0xcbf2_9ce4_8422_2325;
+    for byte in key.as_bytes() {
+        bits ^= u64::from(*byte);
+        bits = bits.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    bits ^= seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    bits ^= (index as u64)
+        .wrapping_add(1)
+        .wrapping_mul(0x2545_f491_4f6c_dd1d);
+    mix64(bits)
+}
+
+fn unit_interval(bits: u64) -> f32 {
+    (bits >> 40) as f32 / (1u64 << 24) as f32
+}
+
+fn unit_signed(bits: u64) -> f32 {
+    unit_interval(bits) * 2.0 - 1.0
+}
+
+/// A slow wobble so a line of glyphs does not sit on a perfect baseline.
+fn baseline_drift(seed: u64, placed: usize) -> f32 {
+    let phase = (seed % 997) as f32 * 0.017;
+    let index = placed as f32;
+    0.9 * (index * 0.23 + phase).sin() + 0.5 * (index * 0.41 + phase * 1.7).sin()
+}
+
+struct InstanceVariation {
+    scale_x: f32,
+    scale_y: f32,
+    rotation: f32,
+    baseline_offset: f32,
+    pressure_scale: f32,
+}
+
+impl InstanceVariation {
+    fn for_instance(seed: u64, key: &str, index: usize) -> Self {
+        let bits = instance_bits(seed, key, index);
+        let mix = |amount: u32| mix64(bits.rotate_left(amount));
+        Self {
+            scale_x: 1.0 + MAX_INSTANCE_SCALE * unit_signed(mix(17)),
+            scale_y: 1.0 + MAX_INSTANCE_SCALE * 1.2 * unit_signed(mix(29)),
+            rotation: MAX_INSTANCE_ROTATION * unit_signed(mix(41)),
+            baseline_offset: MAX_INSTANCE_BASELINE_OFFSET * unit_signed(mix(53)),
+            pressure_scale: MIN_INSTANCE_PRESSURE
+                + (MAX_INSTANCE_PRESSURE - MIN_INSTANCE_PRESSURE) * unit_interval(mix(7)),
+        }
+    }
+
+    /// Rotate and scale about the glyph's baseline midpoint so it pivots like a
+    /// written letter rather than a stamped one.
+    fn point(&self, (x, y): (f32, f32), anchor_x: f32, drift: f32) -> (f32, f32) {
+        let (x, y) = (x - anchor_x, y);
+        let (sin_r, cos_r) = self.rotation.sin_cos();
+        let (x, y) = (x * cos_r - y * sin_r, x * sin_r + y * cos_r);
+        (
+            x * self.scale_x + anchor_x,
+            y * self.scale_y + self.baseline_offset + drift,
+        )
+    }
+}
+
+fn is_delimiter(key: &str) -> bool {
+    matches!(key, "(" | ")" | "[" | "]" | "|")
+}
+
 pub fn png(node: &Node, handwriting: &Handwriting) -> Result<Vec<u8>> {
     png_with_seed(node, handwriting, 0)
 }
@@ -307,6 +407,8 @@ pub fn png_with_seed(node: &Node, handwriting: &Handwriting, seed: u64) -> Resul
         hand: handwriting,
         seed,
         occurrences: HashMap::new(),
+        variation: true,
+        placed: 0,
     };
     let layout = engine.layout(node)?;
     let margin = 22.0;
@@ -390,6 +492,8 @@ struct Layout<'a> {
     hand: &'a Handwriting,
     seed: u64,
     occurrences: HashMap<String, usize>,
+    variation: bool,
+    placed: usize,
 }
 impl Layout<'_> {
     /// Relations and fraction bars belong on the user's math axis, not the
@@ -495,13 +599,20 @@ impl Layout<'_> {
             return Ok(out);
         }
         let g = self.hand.lookup(key)?;
-        let index = self.occurrences.entry(key.to_owned()).or_default();
+        let occurrence = {
+            let index = self.occurrences.entry(key.to_owned()).or_default();
+            let value = *index;
+            *index += 1;
+            value
+        };
         let chosen = if g.variants.is_empty() {
             None
         } else {
-            Some(&g.variants[(*index + (self.seed as usize % g.variants.len())) % g.variants.len()])
+            Some(
+                &g.variants
+                    [(occurrence + (self.seed as usize % g.variants.len())) % g.variants.len()],
+            )
         };
-        *index += 1;
         let bb = chosen
             .and_then(|v| v.bbox.as_ref())
             .or(g.bbox.as_ref())
@@ -518,6 +629,45 @@ impl Layout<'_> {
         {
             return Err(RenderError(format!("invalid bounding box for glyph {key}")));
         }
+        // Delimiters are stretched to a computed height and their width feeds
+        // the surrounding slot math, so they stay unjittered.
+        let variation = if self.variation && !is_delimiter(key) {
+            Some(InstanceVariation::for_instance(self.seed, key, occurrence))
+        } else {
+            None
+        };
+        let drift = if self.variation {
+            baseline_drift(self.seed, self.placed)
+        } else {
+            0.0
+        };
+        self.placed += 1;
+
+        let mut raw: Vec<RawStroke> = Vec::new();
+        let mut ink_min_x = f32::INFINITY;
+        let mut ink_max_x = f32::NEG_INFINITY;
+        for stroke in strokes {
+            if stroke.is_empty() {
+                continue;
+            }
+            let mut points = Vec::with_capacity(stroke.len());
+            for point in stroke {
+                let (x, y) = ((point.x - bb.min_x) * UNIT, -point.y * UNIT);
+                if !x.is_finite() || !y.is_finite() {
+                    return Err(RenderError(format!("invalid stroke point in {key}")));
+                }
+                ink_min_x = ink_min_x.min(x);
+                ink_max_x = ink_max_x.max(x);
+                points.push((x, y));
+            }
+            raw.push((points, stroke.iter().map(|p| p.p).collect()));
+        }
+        // Rotate and scale about the baseline midpoint of the ink.
+        let anchor_x = if ink_min_x.is_finite() && ink_max_x.is_finite() {
+            (ink_min_x + ink_max_x) * 0.5
+        } else {
+            0.0
+        };
         let mut out = Box2 {
             width: ((bb.max_x - bb.min_x) * UNIT).max(3.0) + GAP,
             above: (bb.max_y * UNIT).max(0.0),
@@ -525,23 +675,29 @@ impl Layout<'_> {
             marks: vec![],
             large: matches!(key, "\\int" | "\\oint" | "\\sum" | "\\prod"),
         };
-        for stroke in strokes {
-            if stroke.is_empty() {
-                continue;
-            }
-            let points: Vec<_> = stroke
-                .iter()
-                .map(|p| ((p.x - bb.min_x) * UNIT, -p.y * UNIT))
-                .collect();
-            let pressures = stroke.iter().map(|p| p.p).collect::<Option<Vec<_>>>();
-            if points.iter().any(|(x, y)| !x.is_finite() || !y.is_finite()) {
-                return Err(RenderError(format!("invalid stroke point in {key}")));
+        for (mut points, mut pressures) in raw {
+            if let Some(variation) = &variation {
+                for point in &mut points {
+                    *point = variation.point(*point, anchor_x, drift);
+                }
+                for value in pressures.iter_mut().flatten() {
+                    *value = (*value * variation.pressure_scale).clamp(0.0, 1.0);
+                }
             }
             out.marks.push(Mark {
                 points,
                 pressures,
                 parenthesis: false,
             });
+        }
+        // Measure the drawn ink so jittered glyphs keep correct spacing and are
+        // never clipped by the image bounds.
+        if let Some((min_x, max_x)) = ink_extent(&out, |point| point.0) {
+            out.width = (max_x - min_x).max(3.0) + GAP;
+        }
+        if let Some((min_y, max_y)) = ink_extent(&out, |point| point.1) {
+            out.above = (-min_y).max(0.0);
+            out.below = max_y.max(0.0);
         }
         Ok(out)
     }
@@ -1008,6 +1164,8 @@ mod tests {
             hand: &hand,
             seed: 0,
             occurrences: HashMap::new(),
+            variation: false,
+            placed: 0,
         };
         let fraction = layout.layout(&parse(r"\frac{x}{x}").unwrap()).unwrap();
         let bar = fraction
@@ -1042,6 +1200,8 @@ mod tests {
             hand: &hand,
             seed: 0,
             occurrences: HashMap::new(),
+            variation: false,
+            placed: 0,
         };
         let with_descender = layout.layout(&parse(r"\frac{g}{1}").unwrap()).unwrap();
         let ordinary = layout.layout(&parse(r"\frac{1}{1}").unwrap()).unwrap();
@@ -1058,6 +1218,8 @@ mod tests {
             hand: &hand,
             seed: 0,
             occurrences: HashMap::new(),
+            variation: false,
+            placed: 0,
         };
         let digit_width = layout.glyph("1").unwrap().width;
         let letter_width = layout.glyph("x").unwrap().width;
@@ -1078,6 +1240,8 @@ mod tests {
             hand: &hand,
             seed: 0,
             occurrences: HashMap::new(),
+            variation: false,
+            placed: 0,
         };
         let scripts = layout.layout(&parse(r"x_{1}^{1}").unwrap()).unwrap();
         // Both scripts use the same digit sample. Subscripts should be
@@ -1128,6 +1292,8 @@ mod tests {
             hand: &hand,
             seed: 0,
             occurrences: HashMap::new(),
+            variation: false,
+            placed: 0,
         };
         for expression in [r"\left(x\right)\left(x\right)", ")("] {
             let result = layout.layout(&parse(expression).unwrap()).unwrap();
@@ -1169,6 +1335,8 @@ mod tests {
             hand: &hand,
             seed: 0,
             occurrences: HashMap::new(),
+            variation: false,
+            placed: 0,
         };
         for expression in [r"\left[x\right]\left[x\right]", "]["] {
             let result = layout.layout(&parse(expression).unwrap()).unwrap();
@@ -1209,6 +1377,8 @@ mod tests {
             hand: &hand,
             seed: 0,
             occurrences: HashMap::new(),
+            variation: false,
+            placed: 0,
         }
         .layout(&parse(r"\left(x\right)\left(x\right)").unwrap())
         .unwrap();
@@ -1240,6 +1410,8 @@ mod tests {
             hand: &hand,
             seed: 0,
             occurrences: HashMap::new(),
+            variation: false,
+            placed: 0,
         };
         let plain = layout.layout(&parse(r"\left(1\right)").unwrap()).unwrap();
         let fraction = layout
@@ -1277,6 +1449,8 @@ mod tests {
             hand: &hand,
             seed: 0,
             occurrences: HashMap::new(),
+            variation: false,
+            placed: 0,
         };
         let normal = layout.layout(&parse(r"\left(1\right)").unwrap()).unwrap();
         let tall = layout
@@ -1314,6 +1488,8 @@ mod tests {
             hand: &hand,
             seed: 0,
             occurrences: HashMap::new(),
+            variation: false,
+            placed: 0,
         };
         let integral = layout.glyph("\\int").unwrap();
         let limits = layout.layout(&parse(r"\int_{T_1}^{T_1}").unwrap()).unwrap();
@@ -1349,6 +1525,8 @@ mod tests {
             hand: &hand,
             seed: 0,
             occurrences: HashMap::new(),
+            variation: false,
+            placed: 0,
         };
         let text = layout.text("ab").unwrap();
         let first = text.marks[0].points[1].0;
@@ -1378,6 +1556,8 @@ mod tests {
             hand: &hand,
             seed: 0,
             occurrences: HashMap::new(),
+            variation: false,
+            placed: 0,
         };
         assert_eq!(
             layout.glyph("x").unwrap().marks[0].pressures,
@@ -1388,5 +1568,169 @@ mod tests {
         assert!(pressure_width(0.9) > 2.5);
         assert!(pressure_width(1.0) > 3.0);
         assert_eq!(layout.glyph("T").unwrap().marks[0].pressures, None);
+    }
+
+    fn varied<'a>(hand: &'a Handwriting, seed: u64) -> Layout<'a> {
+        Layout {
+            hand,
+            seed,
+            occurrences: HashMap::new(),
+            variation: true,
+            placed: 0,
+        }
+    }
+
+    #[test]
+    fn instance_variation_is_reproducible_and_distinct_per_occurrence() {
+        let hand = fixture();
+        let points = |seed| {
+            varied(&hand, seed).glyph("x").unwrap().marks[0]
+                .points
+                .clone()
+        };
+        // A fixed seed must reproduce exactly; a different seed must not.
+        assert_eq!(points(0), points(0));
+        assert_ne!(points(0), points(1));
+        // Repeating a glyph inside one expression must vary it.
+        let mut layout = varied(&hand, 0);
+        let first = layout.glyph("x").unwrap().marks[0].points.clone();
+        let second = layout.glyph("x").unwrap().marks[0].points.clone();
+        assert_ne!(first, second);
+        // With variation off the two occurrences are identical.
+        let mut plain = Layout {
+            hand: &hand,
+            seed: 0,
+            occurrences: HashMap::new(),
+            variation: false,
+            placed: 0,
+        };
+        assert_eq!(
+            plain.glyph("x").unwrap().marks[0].points,
+            plain.glyph("x").unwrap().marks[0].points
+        );
+    }
+
+    #[test]
+    fn instance_variation_stays_subtle() {
+        let hand = fixture();
+        let base = {
+            let mut plain = Layout {
+                hand: &hand,
+                seed: 0,
+                occurrences: HashMap::new(),
+                variation: false,
+                placed: 0,
+            };
+            plain.glyph("x").unwrap().marks[0].points.clone()
+        };
+        let mut moved = 0;
+        for seed in 0..64 {
+            let varied_points = varied(&hand, seed).glyph("x").unwrap().marks[0]
+                .points
+                .clone();
+            for (before, after) in base.iter().zip(&varied_points) {
+                let (dx, dy) = ((after.0 - before.0).abs(), (after.1 - before.1).abs());
+                assert!(dx <= 2.0, "horizontal jitter {dx} is too large");
+                assert!(dy <= 5.0, "vertical jitter {dy} is too large");
+                if dx > 0.01 || dy > 0.01 {
+                    moved += 1;
+                }
+            }
+        }
+        assert!(moved > 0, "variation never moved any point");
+    }
+
+    #[test]
+    fn delimiters_are_not_jittered() {
+        let mut hand = fixture();
+        for key in ["(", ")"] {
+            let glyph: Glyph = serde_json::from_value(serde_json::json!({
+                "key": key, "status": "complete",
+                "variants": [{
+                    "baseline": 0,
+                    "bbox": {"minX": 10, "maxX": 50, "minY": -20, "maxY": 100},
+                    "strokes": [[{"x": 50, "y": 100}, {"x": 10, "y": 40}, {"x": 50, "y": -20}]]
+                }]
+            }))
+            .unwrap();
+            hand.glyphs.insert(key.into(), glyph);
+        }
+        let mut layout = varied(&hand, 0);
+        let drawn = layout.layout(&parse(r"\left(1\right)").unwrap()).unwrap();
+        let recorded = &hand.glyphs.get("(").unwrap().variants[0].strokes[0];
+        let first = drawn
+            .marks
+            .iter()
+            .find(|mark| mark.points.len() == recorded.len())
+            .unwrap();
+        // Collected parentheses are stretched vertically to fit their contents,
+        // but jitter would also rotate or scale them horizontally, so the
+        // horizontal deltas must match the recording exactly and the vertical
+        // deltas must follow one uniform stretch factor.
+        let mut stretch: Option<f32> = None;
+        for (pair, recorded_pair) in first.points.windows(2).zip(recorded.windows(2)) {
+            let (dx, dy) = (pair[1].0 - pair[0].0, pair[1].1 - pair[0].1);
+            let (ex, ey) = (
+                (recorded_pair[1].x - recorded_pair[0].x) * UNIT,
+                -(recorded_pair[1].y - recorded_pair[0].y) * UNIT,
+            );
+            assert!(
+                (dx - ex).abs() < 0.01,
+                "horizontal shape changed: {dx} vs {ex}"
+            );
+            if ey.abs() > 0.01 {
+                let ratio = dy / ey;
+                match stretch {
+                    None => stretch = Some(ratio),
+                    Some(expected) => assert!(
+                        (ratio - expected).abs() < 0.01,
+                        "vertical stretch is not uniform: {ratio} vs {expected}"
+                    ),
+                }
+            }
+        }
+        assert!(stretch.is_some(), "delimiter was not stretched vertically");
+    }
+
+    #[test]
+    fn pressure_scaling_varies_weight_between_occurrences() {
+        let mut hand = fixture();
+        let glyph: Glyph = serde_json::from_value(serde_json::json!({
+            "key": "p", "status": "complete",
+            "bbox": {"minX": 0, "maxX": 45, "minY": 0, "maxY": 65},
+            "strokes": [[{"x": 0, "y": 65, "p": 0.5}, {"x": 45, "y": 0, "p": 0.5}]]
+        }))
+        .unwrap();
+        hand.glyphs.insert("p".into(), glyph);
+
+        let mut layout = varied(&hand, 5);
+        let first = layout.glyph("p").unwrap().marks[0]
+            .pressures
+            .clone()
+            .unwrap();
+        let second = layout.glyph("p").unwrap().marks[0]
+            .pressures
+            .clone()
+            .unwrap();
+        assert_ne!(first, second, "weight should vary between occurrences");
+        for value in first.iter().chain(second.iter()) {
+            let factor = value / 0.5;
+            assert!(
+                (MIN_INSTANCE_PRESSURE - 0.001..=MAX_INSTANCE_PRESSURE + 0.001).contains(&factor),
+                "pressure factor {factor} is outside the declared range"
+            );
+        }
+
+        let mut plain = Layout {
+            hand: &hand,
+            seed: 5,
+            occurrences: HashMap::new(),
+            variation: false,
+            placed: 0,
+        };
+        assert_eq!(
+            plain.glyph("p").unwrap().marks[0].pressures,
+            Some(vec![0.5, 0.5])
+        );
     }
 }
