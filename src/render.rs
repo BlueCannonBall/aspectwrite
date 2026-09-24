@@ -398,6 +398,32 @@ fn is_delimiter(key: &str) -> bool {
     matches!(key, "(" | ")" | "[" | "]" | "|")
 }
 
+const HAND_DRAWN_LINE_SEGMENTS: usize = 8;
+const MAX_LINE_WAVE: f32 = 0.9;
+const MAX_LINE_TILT: f32 = 0.9;
+
+/// A hand-drawn straight line: a slight wave and tilt that fade to nothing at
+/// the endpoints, so the line still spans exactly the same two points.
+fn hand_drawn_line(seed: u64, placed: usize, from: (f32, f32), to: (f32, f32)) -> Vec<(f32, f32)> {
+    let bits = instance_bits(seed, "\\fracbar", placed);
+    let phase_a = unit_interval(bits) * std::f32::consts::TAU;
+    let phase_b = unit_interval(mix64(bits.rotate_left(23))) * std::f32::consts::TAU;
+    let tilt = MAX_LINE_TILT * unit_signed(mix64(bits.rotate_left(37)));
+    (0..=HAND_DRAWN_LINE_SEGMENTS)
+        .map(|index| {
+            let t = index as f32 / HAND_DRAWN_LINE_SEGMENTS as f32;
+            let envelope = (std::f32::consts::PI * t).sin();
+            let wave = envelope
+                * (MAX_LINE_WAVE * (t * 5.3 + phase_a).sin()
+                    + 0.5 * MAX_LINE_WAVE * (t * 9.1 + phase_b).sin());
+            (
+                from.0 + (to.0 - from.0) * t,
+                from.1 + (to.1 - from.1) * t + wave + (t - 0.5) * tilt,
+            )
+        })
+        .collect()
+}
+
 pub fn png(node: &Node, handwriting: &Handwriting) -> Result<Vec<u8>> {
     png_with_seed(node, handwriting, 0)
 }
@@ -542,6 +568,13 @@ impl Layout<'_> {
         }
     }
 
+    /// Monotonic count of glyphs placed so far, in layout order.
+    fn next_placement(&mut self) -> usize {
+        let placed = self.placed;
+        self.placed += 1;
+        placed
+    }
+
     fn glyph(&mut self, key: &str) -> Result<Box2> {
         // Use collected parentheses when available; other literal delimiters
         // (and parentheses in older profiles) remain procedural.
@@ -636,12 +669,12 @@ impl Layout<'_> {
         } else {
             None
         };
+        let placed = self.next_placement();
         let drift = if self.variation {
-            baseline_drift(self.seed, self.placed)
+            baseline_drift(self.seed, placed)
         } else {
             0.0
         };
-        self.placed += 1;
 
         let mut raw: Vec<RawStroke> = Vec::new();
         let mut ink_min_x = f32::INFINITY;
@@ -757,7 +790,17 @@ impl Layout<'_> {
                 let bx = (width - bottom.width) / 2.0;
                 out.add(top.translated(tx, ty));
                 out.add(bottom.translated(bx, by));
-                out.line(vec![(2.0, axis), (width - 2.0, axis)]);
+                let bar = if self.variation {
+                    hand_drawn_line(
+                        self.seed,
+                        self.next_placement(),
+                        (2.0, axis),
+                        (width - 2.0, axis),
+                    )
+                } else {
+                    vec![(2.0, axis), (width - 2.0, axis)]
+                };
+                out.line(bar);
                 Ok(out)
             }
             Node::Root(index, body) => {
@@ -1183,6 +1226,40 @@ mod tests {
         assert!(
             (1.0..1.3).contains(&ratio),
             "fraction/full digit height: {ratio}"
+        );
+        // Without variation the bar is a plain two-point line.
+        assert_eq!(bar.points.len(), 2);
+    }
+
+    #[test]
+    fn fraction_bars_are_hand_drawn_when_variation_is_on() {
+        let hand = fixture();
+        let bar = |seed| {
+            let mut layout = varied(&hand, seed);
+            let fraction = layout.layout(&parse(r"\frac{1}{1}").unwrap()).unwrap();
+            fraction
+                .marks
+                .iter()
+                .find(|mark| mark.points.len() == HAND_DRAWN_LINE_SEGMENTS + 1)
+                .map(|mark| mark.points.clone())
+                .expect("a wavy fraction bar")
+        };
+        let first = bar(0);
+        assert_eq!(first, bar(0), "the bar must be reproducible per seed");
+        assert_ne!(first, bar(1), "the bar must differ between seeds");
+
+        let (from, to) = (first[0], first[first.len() - 1]);
+        assert!((from.0 - 2.0).abs() < 0.01, "the bar must start at 2.0");
+        let mut largest = 0.0f32;
+        for (index, point) in first.iter().enumerate() {
+            let t = index as f32 / (first.len() - 1) as f32;
+            let chord = from.1 + (to.1 - from.1) * t;
+            largest = largest.max((point.1 - chord).abs());
+        }
+        assert!(largest > 0.2, "the bar is still straight: {largest}");
+        assert!(
+            largest <= MAX_LINE_WAVE * 1.5,
+            "the bar waves too much: {largest}"
         );
     }
 
