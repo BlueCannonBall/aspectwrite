@@ -404,6 +404,10 @@ const HAND_DRAWN_LINE_SEGMENTS: usize = 8;
 const MAX_LINE_WAVE: f32 = 0.9;
 const MAX_LINE_TILT: f32 = 0.9;
 
+/// How far a hand-drawn bar can wander from its centre line at its worst point:
+/// both wave amplitudes plus half the tilt.
+const MAX_BAR_WOBBLE: f32 = MAX_LINE_WAVE * 1.5 + MAX_LINE_TILT / 2.0;
+
 /// A hand-drawn straight line: a slight wave and tilt that fade to nothing at
 /// the endpoints, so the line still spans exactly the same two points.
 fn hand_drawn_line(seed: u64, placed: usize, from: (f32, f32), to: (f32, f32)) -> Vec<(f32, f32)> {
@@ -775,9 +779,11 @@ impl Layout<'_> {
                 let bottom = self.layout(b)?.scaled(0.55);
                 let width = top.width.max(bottom.width) + 14.0;
                 let axis = -self.math_axis();
-                // Keep all numerator ink, including subscripts and descenders,
-                // clear of the bar's hand-drawn wobble and stroke width.
-                const FRACTION_CLEARANCE: f32 = 6.0;
+                // Let the numerator's lowest ink rest on the bar rather than
+                // float above it, so a subscript reads as written on the bar.
+                // Clear the bar's own wobble and half its thickness, leaving a
+                // hair of white space and never slicing through the ink.
+                const FRACTION_CLEARANCE: f32 = INK_WIDTH / 2.0 + MAX_BAR_WOBBLE + 0.5;
                 let ty = axis - FRACTION_CLEARANCE - top.below;
                 let by = axis + FRACTION_CLEARANCE + bottom.above;
                 let mut out = Box2 {
@@ -1295,10 +1301,16 @@ mod tests {
                     .iter()
                     .map(|point| point.1)
                     .fold(f32::INFINITY, f32::min);
+                // Measured between centre lines, then reduced by the bar's own
+                // half thickness to get the white space the reader sees.
+                let ink_gap = bar_top - numerator_bottom - INK_WIDTH / 2.0;
                 assert!(
-                    bar_top - numerator_bottom >= 2.5,
-                    "{expression}, seed {seed}: numerator/bar gap = {}",
-                    bar_top - numerator_bottom
+                    ink_gap > 0.0,
+                    "{expression}, seed {seed}: the bar slices the numerator, gap = {ink_gap}"
+                );
+                assert!(
+                    ink_gap < 2.5,
+                    "{expression}, seed {seed}: numerator floats {ink_gap}px above the bar"
                 );
             }
         }
