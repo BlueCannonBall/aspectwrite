@@ -796,9 +796,14 @@ impl Layout<'_> {
                 // just above the bar. A subscript then reads as written on the
                 // line, while its descender and any letter descender cross the
                 // bar the way they do when writing by hand.
-                const FRACTION_CLEARANCE: f32 = INK_WIDTH / 2.0 + MAX_BAR_WOBBLE + 0.5;
-                let ty = axis - FRACTION_CLEARANCE - top.script_drop;
-                let by = axis + FRACTION_CLEARANCE + bottom.above;
+                //
+                // The denominator is placed by its ink top rather than its
+                // writing line, so the same distance reads as cramped; it keeps
+                // more air under the bar.
+                const FRACTION_NUMERATOR_GAP: f32 = INK_WIDTH / 2.0 + MAX_BAR_WOBBLE + 0.5;
+                const FRACTION_DENOMINATOR_GAP: f32 = FRACTION_NUMERATOR_GAP + 2.0;
+                let ty = axis - FRACTION_NUMERATOR_GAP - top.script_drop;
+                let by = axis + FRACTION_DENOMINATOR_GAP + bottom.above;
                 // A crossing descender can reach below the denominator, so the
                 // box has to grow to hold it instead of clipping it.
                 let numerator_low = ty + top.below;
@@ -1352,6 +1357,22 @@ mod tests {
                         "{expression}, seed {seed}: subscript floats {visible_gap}px above the bar"
                     );
                 }
+                // The denominator is placed by its ink top, so it keeps more
+                // air under the bar than the numerator's writing line does.
+                let denominator_top = fraction.marks[numerator_mark_count..bar_index]
+                    .iter()
+                    .flat_map(|mark| &mark.points)
+                    .map(|point| point.1)
+                    .fold(f32::INFINITY, f32::min);
+                let bar_bottom = bar
+                    .iter()
+                    .map(|point| point.1)
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let denominator_gap = denominator_top - bar_bottom - INK_WIDTH / 2.0;
+                assert!(
+                    denominator_gap > 2.0,
+                    "{expression}, seed {seed}: denominator is cramped, gap = {denominator_gap}"
+                );
             }
         }
     }
