@@ -316,11 +316,11 @@ fn pressure_width(pressure: f32) -> f32 {
 // occurrence count. It must never depend on wall-clock time or on HashMap
 // iteration order, which Rust randomizes per process, or a fixed seed would
 // stop producing byte-identical output.
-const MAX_INSTANCE_ROTATION: f32 = 0.8 * std::f32::consts::PI / 180.0;
-const MAX_INSTANCE_SCALE: f32 = 0.02;
-const MAX_INSTANCE_BASELINE_OFFSET: f32 = 1.5;
-const MIN_INSTANCE_PRESSURE: f32 = 0.88;
-const MAX_INSTANCE_PRESSURE: f32 = 1.12;
+const MAX_INSTANCE_ROTATION: f32 = 1.6 * std::f32::consts::PI / 180.0;
+const MAX_INSTANCE_SCALE: f32 = 0.045;
+const MAX_INSTANCE_BASELINE_OFFSET: f32 = 3.0;
+const MIN_INSTANCE_PRESSURE: f32 = 0.78;
+const MAX_INSTANCE_PRESSURE: f32 = 1.28;
 
 fn mix64(mut bits: u64) -> u64 {
     bits ^= bits >> 30;
@@ -356,7 +356,7 @@ fn unit_signed(bits: u64) -> f32 {
 fn baseline_drift(seed: u64, placed: usize) -> f32 {
     let phase = (seed % 997) as f32 * 0.017;
     let index = placed as f32;
-    0.9 * (index * 0.23 + phase).sin() + 0.5 * (index * 0.41 + phase * 1.7).sin()
+    1.8 * (index * 0.23 + phase).sin() + 0.9 * (index * 0.41 + phase * 1.7).sin()
 }
 
 struct InstanceVariation {
@@ -1624,20 +1624,28 @@ mod tests {
             plain.glyph("x").unwrap().marks[0].points.clone()
         };
         let mut moved = 0;
+        let mut largest = 0.0f32;
         for seed in 0..64 {
             let varied_points = varied(&hand, seed).glyph("x").unwrap().marks[0]
                 .points
                 .clone();
             for (before, after) in base.iter().zip(&varied_points) {
                 let (dx, dy) = ((after.0 - before.0).abs(), (after.1 - before.1).abs());
-                assert!(dx <= 2.0, "horizontal jitter {dx} is too large");
-                assert!(dy <= 5.0, "vertical jitter {dy} is too large");
+                assert!(dx <= 5.0, "horizontal jitter {dx} is too large");
+                assert!(dy <= 10.0, "vertical jitter {dy} is too large");
                 if dx > 0.01 || dy > 0.01 {
                     moved += 1;
                 }
+                largest = largest.max(dx).max(dy);
             }
         }
         assert!(moved > 0, "variation never moved any point");
+        // A jitter this small is invisible on a real glyph, which is how an
+        // earlier version of this feature shipped without any visible effect.
+        assert!(
+            largest >= 1.5,
+            "variation is too small to notice: largest displacement {largest}"
+        );
     }
 
     #[test]
