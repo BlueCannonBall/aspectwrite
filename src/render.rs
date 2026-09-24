@@ -8,6 +8,8 @@ use tiny_skia::{Color, Paint, PathBuilder, Pixmap, Stroke, Transform};
 pub struct StrokeFile {
     schema: String,
     version: u32,
+    #[serde(default, rename = "inkWidth")]
+    ink_width: Option<f32>,
     glyphs: Vec<Glyph>,
 }
 #[derive(Debug, Deserialize)]
@@ -54,6 +56,7 @@ type Result<T> = std::result::Result<T, RenderError>;
 
 pub struct Handwriting {
     glyphs: HashMap<String, Glyph>,
+    ink: InkWeight,
 }
 impl Handwriting {
     pub fn load(path: &Path) -> Result<Self> {
@@ -73,12 +76,31 @@ impl Handwriting {
             ));
         }
         let mut glyphs = HashMap::new();
+        let mut pressures = Vec::new();
+        for glyph in &file.glyphs {
+            for stroke in glyph.strokes.iter().chain(
+                glyph
+                    .variants
+                    .iter()
+                    .flat_map(|variant| variant.strokes.iter()),
+            ) {
+                pressures.extend(stroke.iter().filter_map(|point| point.p));
+            }
+        }
+        if let Some(ink_width) = file.ink_width
+            && (!ink_width.is_finite() || ink_width <= 0.0)
+        {
+            return Err(RenderError(format!(
+                "inkWidth must be a positive number of pixels, got {ink_width}"
+            )));
+        }
+        let ink = InkWeight::new(&pressures, file.ink_width.unwrap_or(INK_WIDTH));
         for glyph in file.glyphs {
             if glyphs.insert(glyph.key.clone(), glyph).is_some() {
                 return Err(RenderError("duplicate glyph key".into()));
             }
         }
-        Ok(Self { glyphs })
+        Ok(Self { glyphs, ink })
     }
     fn lookup(&self, key: &str) -> Result<&Glyph> {
         let key = match key {
@@ -126,6 +148,80 @@ const TEXT_GAP: f32 = 6.5;
 const DIGIT_GAP: f32 = 9.0;
 // Geometry may shrink for scripts and fractions, but ink width never does.
 const INK_WIDTH: f32 = 2.3;
+
+// Pens and browsers report pressure on different scales, so an absolute
+// pressure-to-width curve is wrong for most stroke files: one profile's usual
+// pressure can sit below another's lightest. Each profile is instead mapped
+// onto one fixed width band, using its own pressure spread, which gives every
+// author the same contrast without making anyone's light strokes invisible.
+const MIN_WEIGHT_FACTOR: f32 = 0.60;
+const MAX_WEIGHT_FACTOR: f32 = 1.40;
+const MIN_PRESSURE_SPAN: f32 = 0.02;
+const CALIBRATION_LOW_QUANTILE: f32 = 0.10;
+const CALIBRATION_MID_QUANTILE: f32 = 0.50;
+const CALIBRATION_HIGH_QUANTILE: f32 = 0.90;
+
+/// Maps recorded pressure onto an ink width for one stroke file.
+struct InkWeight {
+    low: f32,
+    mid: f32,
+    high: f32,
+    base: f32,
+}
+
+impl InkWeight {
+    /// `pressures` is every pressure in the profile; `base` is the width for
+    /// ordinary pressure, either the profile's `inkWidth` or `INK_WIDTH`.
+    fn new(pressures: &[f32], base: f32) -> Self {
+        if pressures.is_empty() {
+            // No pressure anywhere: one uniform width, whatever the base is.
+            return Self {
+                low: 0.0,
+                mid: 0.0,
+                high: 0.0,
+                base,
+            };
+        }
+        let mut sorted = pressures.to_vec();
+        sorted.sort_by(f32::total_cmp);
+        let at = |quantile: f32| {
+            let index = ((sorted.len() - 1) as f32 * quantile).round() as usize;
+            sorted[index]
+        };
+        Self {
+            low: at(CALIBRATION_LOW_QUANTILE),
+            mid: at(CALIBRATION_MID_QUANTILE),
+            high: at(CALIBRATION_HIGH_QUANTILE),
+            base,
+        }
+    }
+
+    fn width(&self, pressure: f32) -> f32 {
+        if self.high - self.low < MIN_PRESSURE_SPAN {
+            // A flat profile carries no pressure signal to calibrate against.
+            return self.base;
+        }
+        // Anchor the profile's own light, ordinary, and heavy pressure on the
+        // band edges and centre, so every author gets the same weight range and
+        // the same weight at ordinary pressure regardless of their pen.
+        let t = if pressure <= self.mid {
+            let lower = self.mid - self.low;
+            if lower < MIN_PRESSURE_SPAN {
+                0.5
+            } else {
+                0.5 * ((pressure - self.low) / lower).clamp(0.0, 1.0)
+            }
+        } else {
+            let upper = self.high - self.mid;
+            if upper < MIN_PRESSURE_SPAN {
+                0.5
+            } else {
+                0.5 + 0.5 * ((pressure - self.mid) / upper).clamp(0.0, 1.0)
+            }
+        };
+        self.base * (MIN_WEIGHT_FACTOR + (MAX_WEIGHT_FACTOR - MIN_WEIGHT_FACTOR) * t)
+    }
+}
 #[derive(Clone)]
 struct Mark {
     points: Vec<(f32, f32)>,
@@ -307,13 +403,6 @@ fn vary_parenthesis(mark: &mut Mark) {
     }
 }
 
-fn pressure_width(pressure: f32) -> f32 {
-    // Keep light-pressure strokes legible while retaining a modest pressure
-    // response. At the usual 0.5 mouse/default pressure this matches INK_WIDTH.
-    let p = pressure.clamp(0.0, 1.0);
-    2.0 + 0.6 * p
-}
-
 // Per-instance variation is derived only from the seed, the glyph key and the
 // occurrence count. It must never depend on wall-clock time or on HashMap
 // iteration order, which Rust randomizes per process, or a fixed seed would
@@ -439,6 +528,7 @@ pub fn png_with_seed(node: &Node, handwriting: &Handwriting, seed: u64) -> Resul
         placed: 0,
     };
     let layout = engine.layout(node)?;
+    let ink = &handwriting.ink;
     let margin = 22.0;
     let w = (layout.width + margin * 2.0).ceil().max(1.0);
     let h = (layout.above + layout.below + margin * 2.0).ceil().max(1.0);
@@ -459,7 +549,7 @@ pub fn png_with_seed(node: &Node, handwriting: &Handwriting, seed: u64) -> Resul
             let width = mark
                 .pressures
                 .as_ref()
-                .map_or(INK_WIDTH, |p| pressure_width(p[0]));
+                .map_or(ink.base, |p| ink.width(p[0]));
             builder.push_circle(margin + x, margin + layout.above + y, width / 2.0);
             if let Some(path) = builder.finish() {
                 let mut paint = Paint::default();
@@ -484,7 +574,7 @@ pub fn png_with_seed(node: &Node, handwriting: &Handwriting, seed: u64) -> Resul
                 builder.line_to(margin + x2, margin + layout.above + y2);
                 if let Some(path) = builder.finish() {
                     let stroke = Stroke {
-                        width: pressure_width((values[0] + values[1]) * 0.5),
+                        width: ink.width((values[0] + values[1]) * 0.5),
                         line_cap: tiny_skia::LineCap::Round,
                         ..Stroke::default()
                     };
@@ -499,7 +589,7 @@ pub fn png_with_seed(node: &Node, handwriting: &Handwriting, seed: u64) -> Resul
             }
             if let Some(path) = builder.finish() {
                 let stroke = Stroke {
-                    width: INK_WIDTH,
+                    width: ink.base,
                     line_cap: tiny_skia::LineCap::Round,
                     line_join: tiny_skia::LineJoin::Round,
                     ..Stroke::default()
@@ -1198,6 +1288,7 @@ mod tests {
                 .into_iter()
                 .map(|g| (g.key.clone(), g))
                 .collect(),
+            ink: InkWeight::new(&[], INK_WIDTH),
         }
     }
 
@@ -1515,8 +1606,14 @@ mod tests {
         assert!(large.points[0].1 < small.points[0].1);
         assert!(large.points[0].0 - large.points[10].0 > small.points[0].0 - small.points[10].0);
         let widths = large.pressures.as_ref().unwrap();
-        assert!(pressure_width(widths[0]) < pressure_width(widths[10]));
-        assert!(pressure_width(widths[20]) < pressure_width(widths[10]));
+        let ink = InkWeight {
+            low: 0.1,
+            mid: 0.5,
+            high: 0.9,
+            base: INK_WIDTH,
+        };
+        assert!(ink.width(widths[0]) < ink.width(widths[10]));
+        assert!(ink.width(widths[20]) < ink.width(widths[10]));
     }
 
     #[test]
@@ -1656,11 +1753,92 @@ mod tests {
             layout.glyph("x").unwrap().marks[0].pressures,
             Some(vec![0.1, 0.9])
         );
-        assert!(pressure_width(0.0) >= 2.0);
-        assert!((pressure_width(0.5) - INK_WIDTH).abs() < 0.001);
-        assert!(pressure_width(0.9) > pressure_width(0.1));
-        assert!(pressure_width(1.0) <= 2.6);
+        let ink = InkWeight {
+            low: 0.1,
+            mid: 0.5,
+            high: 0.9,
+            base: INK_WIDTH,
+        };
+        assert!((ink.width(0.1) - INK_WIDTH * MIN_WEIGHT_FACTOR).abs() < 0.001);
+        assert!((ink.width(0.5) - INK_WIDTH).abs() < 0.001);
+        assert!((ink.width(0.9) - INK_WIDTH * MAX_WEIGHT_FACTOR).abs() < 0.001);
+        assert!(ink.width(0.9) > ink.width(0.5));
+        assert!(ink.width(0.5) > ink.width(0.1));
+        // Pressures outside the profile's own range clamp to the band edges.
+        assert!((ink.width(0.0) - ink.width(0.1)).abs() < 0.001);
+        assert!((ink.width(1.0) - ink.width(0.9)).abs() < 0.001);
         assert_eq!(layout.glyph("T").unwrap().marks[0].pressures, None);
+    }
+
+    #[test]
+    fn ink_weight_is_calibrated_to_each_profile() {
+        // The same relative spread reported on two different pressure scales
+        // must produce the same widths. This is the whole point of the
+        // calibration: one profile's ordinary pressure can sit below another's
+        // lightest, and an absolute curve cannot serve both.
+        let ramp = |start: f32| -> Vec<f32> {
+            (0..=100).map(|i| start + 0.30 * i as f32 / 100.0).collect()
+        };
+        let light = InkWeight::new(&ramp(0.05), INK_WIDTH);
+        let heavy = InkWeight::new(&ramp(0.45), INK_WIDTH);
+        // Light, ordinary, and heavy pressure agree across both scales.
+        assert!((light.width(0.08) - heavy.width(0.48)).abs() < 0.001);
+        assert!((light.width(0.20) - heavy.width(0.60)).abs() < 0.001);
+        assert!((light.width(0.32) - heavy.width(0.72)).abs() < 0.001);
+        // Ordinary pressure lands exactly on the base weight for both.
+        assert!((light.width(0.20) - INK_WIDTH).abs() < 0.001);
+        assert!((heavy.width(0.60) - INK_WIDTH).abs() < 0.001);
+        // And each profile still spans the full band.
+        assert!((light.width(0.08) - INK_WIDTH * MIN_WEIGHT_FACTOR).abs() < 0.001);
+        assert!((heavy.width(0.72) - INK_WIDTH * MAX_WEIGHT_FACTOR).abs() < 0.001);
+
+        // A profile with no pressure spread has nothing to calibrate against.
+        let flat = InkWeight::new(&[0.5; 200], INK_WIDTH);
+        assert!((flat.width(0.1) - INK_WIDTH).abs() < 0.001);
+        assert!((flat.width(0.9) - INK_WIDTH).abs() < 0.001);
+
+        // A profile with no pressures at all matches a flat one.
+        let none = InkWeight::new(&[], INK_WIDTH);
+        assert!((none.width(0.0) - INK_WIDTH).abs() < 0.001);
+
+        // The base weight scales the whole band.
+        let doubled = InkWeight::new(&ramp(0.05), INK_WIDTH * 2.0);
+        assert!((doubled.width(0.2) - 2.0 * light.width(0.2)).abs() < 0.001);
+    }
+
+    #[test]
+    fn ink_width_field_sets_the_base_weight_and_is_validated() {
+        let directory = std::env::temp_dir();
+        let write = |name: &str, ink_width: &str| {
+            let path = directory.join(format!("aspectwrite-ink-{}.json", name));
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"schema":"aspectwrite.handwriting","version":2,{ink_width}
+                        "glyphs":[{{"key":"a","status":"complete",
+                        "bbox":{{"minX":0,"maxX":40,"minY":0,"maxY":90}},
+                        "strokes":[[{{"x":0,"y":90,"p":0.2}},{{"x":40,"y":0,"p":0.8}}]]}}]}}"#
+                ),
+            )
+            .unwrap();
+            let loaded = Handwriting::load(&path);
+            (path, loaded)
+        };
+
+        let (path, loaded) = write("default", "");
+        let hand = loaded.unwrap();
+        assert!((hand.ink.base - INK_WIDTH).abs() < 0.001);
+        std::fs::remove_file(path).unwrap();
+
+        let (path, loaded) = write("custom", r#""inkWidth": 4.0,"#);
+        let hand = loaded.unwrap();
+        assert!((hand.ink.base - 4.0).abs() < 0.001);
+        assert!((hand.ink.width(0.2) - 4.0 * MIN_WEIGHT_FACTOR).abs() < 0.001);
+        std::fs::remove_file(path).unwrap();
+
+        let (path, loaded) = write("invalid", r#""inkWidth": -1,"#);
+        assert!(loaded.is_err());
+        std::fs::remove_file(path).unwrap();
     }
 
     fn varied<'a>(hand: &'a Handwriting, seed: u64) -> Layout<'a> {
