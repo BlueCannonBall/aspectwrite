@@ -148,6 +148,7 @@ const TEXT_GAP: f32 = 6.5;
 const DIGIT_GAP: f32 = 9.0;
 const SUBSCRIPT_INK_GAP: f32 = 7.0;
 const ENTRY_STROKE_START_WEIGHT: f32 = 0.47;
+const ENTRY_STROKE_TIP_WEIGHT: f32 = 0.15;
 const ENTRY_STROKE_JOIN_LENGTH: f32 = 1.0;
 const L_ENTRY_STROKE_TAPER_LENGTH: f32 = 9.0;
 const ONE_ENTRY_STROKE_TAPER_LENGTH: f32 = 25.0;
@@ -828,22 +829,29 @@ pub fn png_with_seed_scaled(
                     captured_distance += (to.0 - from.0).hypot(to.1 - from.1);
                     last += 1;
                 }
-                let mut entry = PathBuilder::new();
-                let (x, y) = mark.points[0];
-                entry.move_to((margin + x) * scale, (margin + layout.above + y) * scale);
-                for &(x, y) in &mark.points[1..=last] {
-                    entry.line_to((margin + x) * scale, (margin + layout.above + y) * scale);
-                }
-                if let Some(path) = entry.finish() {
-                    let stroke = Stroke {
-                        width: ink.width(pressures[mark.entry_tail_points])
-                            * ENTRY_STROKE_START_WEIGHT
-                            * scale,
-                        line_cap: tiny_skia::LineCap::Round,
-                        line_join: tiny_skia::LineJoin::Round,
-                        ..Stroke::default()
+                let join_width = ink.width(pressures[mark.entry_tail_points]);
+                // Taper the entry itself: its tip is the thinnest point, and the
+                // width climbs to the join weight at the recorded downstroke.
+                for index in 0..last {
+                    let ((x1, y1), (x2, y2)) = (mark.points[index], mark.points[index + 1]);
+                    let factor = if index < mark.entry_tail_points {
+                        let progress = (index as f32 + 1.0) / mark.entry_tail_points as f32;
+                        ENTRY_STROKE_TIP_WEIGHT
+                            + (ENTRY_STROKE_START_WEIGHT - ENTRY_STROKE_TIP_WEIGHT) * progress
+                    } else {
+                        ENTRY_STROKE_START_WEIGHT
                     };
-                    pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+                    let mut builder = PathBuilder::new();
+                    builder.move_to((margin + x1) * scale, (margin + layout.above + y1) * scale);
+                    builder.line_to((margin + x2) * scale, (margin + layout.above + y2) * scale);
+                    if let Some(path) = builder.finish() {
+                        let stroke = Stroke {
+                            width: join_width * factor * scale,
+                            line_cap: tiny_skia::LineCap::Round,
+                            ..Stroke::default()
+                        };
+                        pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+                    }
                 }
                 rendered_entry_segments = last;
             }
